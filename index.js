@@ -4686,102 +4686,87 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
 /**
  * 批量场景扫描（一次 AI 调用判定一组章节，默认 10 章/组）：
  * 本地场景引擎先为每章提取场景窗口原文 → 打包成材料 → AI 逐章标记 has_gap →
- * 写回每章 judge（本地安全否决优先；AI 遗漏章节回退本地初筛结论）。
- * AI 调用/解析失败时整组降级为本地场景引擎初筛（不会全部失败），失败原因写入每章 error 供详情查看。
+ * 写回每章 judge。**失败就失败，不降级**：AI 调用/解析失败整组标失败（错误写入每章 error）；
+ * AI 未返回的章节标失败；本地安全否决（未成年/非自愿/多人男等词表直接命中）始终优先。
  * 标记「是/存疑」的章节后续单独走原 AI 加料流程。
  */
 async function judgeChapterBatch(group, { signal = null } = {}) {
     const list = (Array.isArray(group) ? group : [group]).filter(ch => ch && ch.text);
     if (!list.length) return;
-    let scoredByIndex = new Map();
-    let fallbackMsg = '';
+    const rules = niJudgeRules();
+    const api = niJudgeApiCfg();
+    if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
+    const sceneCfg = niSceneConfig();
+    const bookProfile = niGetBookProfile().profile;
+    const autoNames = niGetAutoNames();
+    const aiThreshold = Number(rules.aiThreshold) || 0.6;
+
+    // 本地场景引擎初筛：仅用于安全否决与场景窗口明细（不参与判定结论，失败也不回退）
+    const scoredByIndex = new Map();
+    for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
+
+    const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
+    const chaptersText = buildBatchChaptersText(list, {
+        sceneConfig: sceneCfg,
+        bookProfile,
+        autoNames,
+        maxCharsPerChapter: Number(sceneCfg.batch_max_chars_per_chapter) || 1200,
+    });
+    const messages = buildBatchJudgeMessages(template, {
+        chaptersText,
+        rulesSummary: buildJudgeRulesSummary(rules),
+    });
+    // 输出上限按 4000 起（10 章 evidence 常超 2000），截断自动放大到 8000
+    const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 4000 });
+    let byIndex;
     try {
-        const rules = niJudgeRules();
-        const api = niJudgeApiCfg();
-        if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
-        const sceneCfg = niSceneConfig();
-        const bookProfile = niGetBookProfile().profile;
-        const autoNames = niGetAutoNames();
-        const aiThreshold = Number(rules.aiThreshold) || 0.6;
+        byIndex = parseBatchJudgeResponse(raw);
+    } catch (parseErr) {
+        // 解析失败（截断/围栏/模型乱输出）：追加「格式纠正」指令重试一次，输出上限直接拉满
+        console.warn('[NI] 批量判定 JSON 解析失败，追加格式纠正重试:', parseErr?.message || parseErr);
+        const retryMessages = [...messages, {
+            role: 'user',
+            content: `【格式纠正要求（必须遵守）】\n上一次输出不是有效的 JSON（原因：${parseErr?.message || parseErr}）。请重新输出：只输出一个 JSON 对象 {"chapters": [{"index": 编号, "has_gap": true或false, "confidence": 0到1的小数, "evidence": "..."}]}，不要输出任何解释、Markdown 代码围栏或其他文字；chapters 必须覆盖全部 ${list.length} 章，index 与材料章节编号一致。`,
+        }];
+        const raw2 = await niJudgeCallRetry(retryMessages, api, signal, { baseLength: 8000 });
+        byIndex = parseBatchJudgeResponse(raw2); // 仍失败则抛出（错误信息已附原始响应片段）
+    }
 
-        // 本地场景引擎初筛（窗口明细/安全否决；AI 遗漏或降级时回退）
-        for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
-
-        const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
-        const chaptersText = buildBatchChaptersText(list, {
-            sceneConfig: sceneCfg,
-            bookProfile,
-            autoNames,
-            maxCharsPerChapter: Number(sceneCfg.batch_max_chars_per_chapter) || 1200,
-        });
-        const messages = buildBatchJudgeMessages(template, {
-            chaptersText,
-            rulesSummary: buildJudgeRulesSummary(rules),
-        });
-        const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 2000 });
-        const byIndex = parseBatchJudgeResponse(raw);
-
-        for (const ch of list) {
-            const scored = scoredByIndex.get(ch.index) || niScoreChapter(ch);
-            // 本地安全否决优先（词表直接命中，比 AI 可靠）
-            if (scored.vetoed) {
-                ch.judge = { ...keywordJudgeToStore(scored), result: 'vetoed', hybridPending: false, at: Date.now() };
-            } else {
-                const res = byIndex.get(ch.index);
-                if (!res) {
-                    // AI 遗漏该章：回退本地初筛结论
-                    const cls = classifyKeywordResult(scored);
-                    ch.judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
-                } else {
-                    const isDoubt = res.confidence < aiThreshold;
-                    ch.judge = {
-                        result: isDoubt ? 'doubt' : res.result,
-                        confidence: res.confidence,
-                        evidence: res.evidence || scored.evidence,
-                        mode: 'batch',
-                        scenes: scored.scenes,
-                        safety: scored.safety,
-                        bookProfile: scored.bookProfile,
-                        modes: scored.modes,
-                        score: scored.score,
-                        hitCount: scored.hitCount,
-                        at: Date.now(),
-                    };
-                }
-            }
+    for (const ch of list) {
+        const scored = scoredByIndex.get(ch.index) || niScoreChapter(ch);
+        // 本地安全否决优先（词表直接命中，比 AI 可靠；属安全拦截，非降级）
+        if (scored.vetoed) {
+            ch.judge = { ...keywordJudgeToStore(scored), result: 'vetoed', hybridPending: false, at: Date.now() };
             delete ch.error;
             transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+            continue;
         }
-        niEnrichScheduleSave();
-    } catch (err) {
-        if (signal?.aborted || err?.message === 'AbortError') throw err;
-        // 降级：整组回退本地场景引擎初筛，AI 失败原因写入每章 error（详情弹窗可查）
-        const hint = /context|token|length|400|maximum|too large/i.test(String(err?.message || ''))
-            ? '（可能是输入/输出超出模型上限：请调小每批章数或「每章材料上限」，或换上下文更大的模型）'
-            : '';
-        fallbackMsg = `批量 AI 判定失败，已回退本地场景引擎初筛：${err?.message || err}${hint}`;
-        console.warn('[NI] 批量场景扫描降级为本地初筛:', err?.message || err);
-        for (const ch of list) {
-            let scored = scoredByIndex.get(ch.index);
-            try { scored = scored || niScoreChapter(ch); } catch (_) { scored = null; }
-            if (scored) {
-                const cls = classifyKeywordResult(scored);
-                ch.judge = {
-                    ...keywordJudgeToStore(scored),
-                    result: scored.vetoed ? 'vetoed' : cls.result,
-                    hybridPending: false,
-                    fallbackReason: fallbackMsg,
-                    at: Date.now(),
-                };
-                ch.error = fallbackMsg;
-                transitionChapter(ch, CHAPTER_STATUS.JUDGED);
-            } else {
-                ch.error = err?.message || String(err);
-                transitionChapter(ch, CHAPTER_STATUS.FAILED);
-            }
+        const res = byIndex.get(ch.index);
+        if (!res) {
+            // AI 未返回该章：标记失败（不降级、不回退本地初筛）
+            ch.error = '批量 AI 判定未返回该章节结果（可能输出被截断或格式不符），请重试或调小每批章数';
+            transitionChapter(ch, CHAPTER_STATUS.FAILED);
+            niEnrichScheduleSave();
+            continue;
         }
-        niEnrichScheduleSave();
+        const isDoubt = res.confidence < aiThreshold;
+        ch.judge = {
+            result: isDoubt ? 'doubt' : res.result,
+            confidence: res.confidence,
+            evidence: res.evidence || scored.evidence,
+            mode: 'batch',
+            scenes: scored.scenes,
+            safety: scored.safety,
+            bookProfile: scored.bookProfile,
+            modes: scored.modes,
+            score: scored.score,
+            hitCount: scored.hitCount,
+            at: Date.now(),
+        };
+        delete ch.error;
+        transitionChapter(ch, CHAPTER_STATUS.JUDGED);
     }
+    niEnrichScheduleSave();
 }
 
 /**
