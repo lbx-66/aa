@@ -3972,10 +3972,11 @@ select.ni-modal-input {
    TauriTavern 安卓 / 窄屏 WebView 适配（触屏友好 + 防溢出）
    ============================================================ */
 @media (max-width: 640px) {
-  /* 固定 600px 高度在手机上会把底栏导航挤出抽屉命中区域（看得见但点不到）：
-     改为流式高度 + 底栏 sticky 钉在可视区底部 */
-  .ni-app { height: auto; min-height: 100%; }
-  .ni-scroll { overflow-y: visible; }
+  /* 固定 600px 高度在手机上会把底栏导航挤出抽屉命中区域（看得见但点不到）；
+     改为视口自适应固定高度（面板不随页面内容伸缩，避免空页面导致底栏 sheet 缩回去）
+     + 底栏 sticky 钉在可视区底部 */
+  .ni-app { height: 82vh; height: min(600px, 82vh); min-height: 0; }
+  .ni-scroll { overflow-y: auto; }
   .ni-btm-nav {
     position: sticky;
     bottom: 0;

@@ -393,7 +393,7 @@ const DEFAULT_SETTINGS = {
     judgePrompts: { template: DEFAULT_JUDGE_PROMPT },
     judgeApi: { url: '', key: '', model: '', stream: false, timeoutSec: 60, retries: 2, temperature: 0.3 },
     // AI 加料（P3）
-    enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false },
+    enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
     enrichTemplates: DEFAULT_ENRICH_TEMPLATES,  // 模板库（读取走 niEnrichTemplates 克隆）
     enrichParams: { intensity: 'medium', maxTokens: 4000, maxTokensAuto: true },
     enrichSafety: { enabled: true, sensitiveWords: [] },
@@ -1353,6 +1353,49 @@ function niBindNavbarGlobal() {
         }
         touchStart = null;
         fire(e);
+    }, true);
+}
+
+/**
+ * 弹窗/关键操作按钮的全局动作分发（document 捕获阶段 + composedPath）。
+ * 与导航兜底同理：不依赖 $app 委托（TauriTavern 安卓上 $app 委托不可靠）。
+ * 这些按钮的 $app 绑定已移除，本分发是唯一来源，不会重复触发。
+ */
+function niBindGlobalActions() {
+    if (typeof window !== 'undefined' && window._niGlobalActionsBound) return;
+    if (typeof window !== 'undefined') window._niGlobalActionsBound = true;
+
+    const ACTIONS = {
+        'ni-e-detail-cancel': () => niEnrichCloseDetail(),
+        'ni-e-detail-save': () => niEnrichSaveDetail(),
+        'ni-e-detail-split': () => niEnrichSplitDetail(),
+        'ni-e-detail-enrich-btn': () => { const btn = document.getElementById('ni-e-detail-enrich-btn'); if (btn) void niEnrichDetailGenerate(btn); },
+        'ni-e-detail-enrich-stop': () => _niEnrichDetailController?.abort?.(),
+        'ni-e-report-close': () => { const el = document.getElementById('ni-e-report-modal'); if (el) el.style.display = 'none'; },
+        'ni-e-report-restore': () => niEnrichRestoreFiltered(),
+        'ni-vec-debug-close': () => { const el = document.getElementById('ni-vec-debug-modal'); if (el) el.style.display = 'none'; },
+    };
+
+    document.addEventListener('click', (e) => {
+        const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+        let target = null;
+        for (const el of path) {
+            if (!el || typeof el.id !== 'string' || !el.id) continue;
+            if (Object.prototype.hasOwnProperty.call(ACTIONS, el.id)) { target = el; break; }
+        }
+        if (!target && e.target && e.target.id && Object.prototype.hasOwnProperty.call(ACTIONS, e.target.id)) {
+            target = e.target;
+        }
+        if (!target) return;
+        const id = target.id;
+        if (target.disabled === true) return;
+        console.log(`[NI] 全局动作分发 → #${id}`);
+        try {
+            ACTIONS[id]();
+        } catch (err) {
+            console.error(`[NI] 动作执行失败 #${id}:`, err);
+            toastr?.error?.('[NI] ' + (err?.message || err));
+        }
     }, true);
 }
 
@@ -3872,6 +3915,55 @@ function niEnrichStateText(ch) {
     return base + lenPart + shortPart + segPart + mergePart;
 }
 
+/** 详情弹窗：AI 生成加料（流式实时追加；由全局动作分发调用，避免依赖 $app 委托）。 */
+async function niEnrichDetailGenerate(btn) {
+    if (!_niEnrichDetailId) return;
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
+    const ch = chapters.find(c => c.id === _niEnrichDetailId);
+    if (!ch || !canEnrichChapter(ch)) { toastr?.warning('本章无加料资格（需判定为「是/存疑」或标记「通过」）'); return; }
+    const stopBtn = q('#ni-e-detail-enrich-stop');
+    const ta = q('#ni-e-detail-enrich');
+    const stateEl = q('#ni-e-detail-enrich-state');
+    const controller = new AbortController();
+    _niEnrichDetailController = controller;
+    if (btn) btn.disabled = true;
+    if (stopBtn) stopBtn.style.display = '';
+    if (ta) ta.value = '';
+    if (stateEl) stateEl.textContent = '生成中…';
+    try {
+        const result = await enrichChapter(ch, chapters.indexOf(ch), {
+            signal: controller.signal,
+            onDelta: delta => {
+                if (ta) {
+                    ta.value += delta;
+                    ta.scrollTop = ta.scrollHeight;
+                }
+            },
+        });
+        if (result?.noContent) toastr?.info('本章无可加料内容，已跳过（保留原文）');
+        else if (result?.short) toastr?.warning(`加料完成，但仅 ${result.charCount} 字（要求 ≥${ENRICH_MIN_CHARS} 字），建议重新生成`);
+        else toastr?.success(result.reviewed ? '加料完成' : '加料完成，但内容含敏感词，请人工审核');
+    } catch (err) {
+        if (err?.message !== 'AbortError') toastr?.error(`加料失败：${err?.message || err}`);
+    } finally {
+        if (btn) btn.disabled = false;
+        if (stopBtn) stopBtn.style.display = 'none';
+        _niEnrichDetailController = null;
+        if (stateEl && ch.enrich) {
+            if (ch.enrich.noContent) {
+                stateEl.textContent = '无加料（AI 判定原文无可加料内容，已保留原文）';
+                if (ta) ta.value = '';
+            } else {
+                if (ta) ta.value = ch.enrich.text || '';
+                stateEl.textContent = niEnrichStateText(ch);
+            }
+        }
+        niEnrichRenderList();
+        niEnrichRenderStats();
+        niEnrichSyncButtons(false);
+    }
+}
+
 function niEnrichOpenDetail(id) {
     const ch = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).find(c => c.id === id);
     if (!ch) return;
@@ -4773,7 +4865,13 @@ function niGetTavernServiceSettings() {
 function niEnrichApiCfg() {
     const base = { ...DEFAULT_SETTINGS.enrichApi };
     const saved = extension_settings[EXT_NAME]?.enrichApi;
-    return saved && typeof saved === 'object' ? { ...base, ...saved } : base;
+    if (!saved || typeof saved !== 'object') return base;
+    const merged = { ...base, ...saved };
+    // 旧配置迁移：之前是「预设 XOR 独立」二选一，未存 useIndependentApi 时按旧语义推断
+    if (merged.useIndependentApi === undefined) {
+        merged.useIndependentApi = merged.useTavernPreset !== true;
+    }
+    return merged;
 }
 
 function niEnrichSaveApi(patch) {
@@ -4875,8 +4973,13 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
     if (ch.status !== CHAPTER_STATUS.ENRICHING) transitionChapter(ch, CHAPTER_STATUS.ENRICHING);
     try {
         const api = niEnrichApiCfg();
-        if (api.useTavernPreset !== true && (!api.url || !api.model)) {
-            throw new Error('请先在「加料设置」中填写接口地址与模型，或勾选「使用酒馆主预设」');
+        const useInd = api.useIndependentApi === true;
+        const usePreset = api.useTavernPreset === true;
+        if (!useInd && !usePreset) {
+            throw new Error('请先选择 API 来源：在「加料设置」勾选「使用酒馆主预设」或「独立 API 配置」（两者可同时勾选）');
+        }
+        if (useInd && (!api.url || !api.model)) {
+            throw new Error('请先在「加料设置」的独立 API 配置中填写接口地址与模型');
         }
         const templates = niEnrichTemplates();
         const params = niEnrichParams();
@@ -4893,7 +4996,8 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         // 复用项目「跟随酒馆预设」机制（createTavernPresetMessageTools）：
         // 正确筛选（排除上下文/标记占位提示词）+ 酒馆宏替换（{{setvar::}}/{{getvar::}}/{{user}} 等）；
         // 加料文风/人设跟随预设；任务模板与输出规范仍在最后一条生效。
-        if (api.useTavernPreset === true) {
+        // 注意：预设只提供提示词/模型跟随，与「独立 API 连接」互不排斥（可同时勾选）。
+        if (usePreset) {
             try {
                 const presetMsgs = await niBuildTavernPresetPromptMessages();
                 if (presetMsgs.length) {
@@ -4913,7 +5017,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             const oai = (typeof oai_settings === 'object' && oai_settings) ? oai_settings : {};
             const source = String(oai.chat_completion_source || 'openai');
             const curModel = String(
-                api.useTavernPreset === true
+                (usePreset && !useInd)
                     ? (oai[`${source}_model`] || oai.model || '')
                     : (api.model || '')
             ).trim();
@@ -5199,19 +5303,21 @@ function niEnrichSaveTemplateFromUI() {
 }
 
 // —— 设置同步 ——
-function niEnrichSyncTavernUI(usePreset) {
-    ['#ni-e-api-url', '#ni-e-api-key', '#ni-e-api-model'].forEach(sel => {
-        const el = q(sel);
-        if (el) el.disabled = !!usePreset;
-    });
+/** 同步加料 API 来源 UI：两个独立勾选（使用酒馆主预设 / 独立 API 配置），可同时勾选或同时取消。 */
+function niEnrichSyncTavernUI(usePreset, useIndependent) {
     const indBox = q('#ni-e-api-ind-box');
     const tvBox = q('#ni-e-api-tavern-box');
-    if (indBox) indBox.style.display = usePreset ? 'none' : '';
+    if (indBox) indBox.style.display = useIndependent ? '' : 'none';
     if (tvBox) tvBox.style.display = usePreset ? '' : 'none';
-    const indRadio = q('#ni-e-api-mode-ind');
-    const tvRadio = q('#ni-e-api-mode-tavern');
-    if (indRadio) indRadio.checked = !usePreset;
-    if (tvRadio) tvRadio.checked = !!usePreset;
+    const indChk = q('#ni-e-api-ind');
+    const tvChk = q('#ni-e-api-tavern');
+    if (indChk) indChk.checked = !!useIndependent;
+    if (tvChk) tvChk.checked = !!usePreset;
+    // 独立未勾选时禁用地址/Key/模型输入（避免误填）
+    ['#ni-e-api-url', '#ni-e-api-key', '#ni-e-api-model'].forEach(sel => {
+        const el = q(sel);
+        if (el) el.disabled = !useIndependent;
+    });
 }
 
 function niEnrichSyncSettingsUI() {
@@ -5230,7 +5336,7 @@ function niEnrichSyncSettingsUI() {
     sv('#ni-e-api-quota', api.dailyQuota ?? 0);
     const usedEl = q('#ni-e-api-quota-used');
     if (usedEl) usedEl.textContent = String(niEnrichDailyUsed());
-    niEnrichSyncTavernUI(api.useTavernPreset === true);
+    niEnrichSyncTavernUI(api.useTavernPreset === true, api.useIndependentApi === true);
     sv('#ni-e-intensity', params.intensity || 'medium');
     sv('#ni-e-max-tokens', params.maxTokens ?? 4000);
     const maxAutoEl = q('#ni-e-max-auto');
@@ -5320,8 +5426,9 @@ jQuery(async () => {
         }
     }
     niBindTopbarIconToggleHandlers();
-    // 底栏导航立即全局绑定（即使后续初始化抛错，导航仍可用）
+    // 底栏导航与弹窗操作按钮立即全局绑定（即使后续初始化抛错，这些控件仍可用）
     niBindNavbarGlobal();
+    niBindGlobalActions();
 
     // ── 在 template 插入 DOM 后，立即将 FAB/popup 挂到 body ──
     if (typeof window.niPopBootstrap === 'function') {
@@ -5393,8 +5500,7 @@ jQuery(async () => {
     });
     $app.on('click', '#ni-e-apply-filter', () => niEnrichRefilter());
     $app.on('click', '#ni-e-view-report', () => { niEnrichRenderReport(); q('#ni-e-report-modal').style.display = 'flex'; });
-    $app.on('click', '#ni-e-report-close', () => { q('#ni-e-report-modal').style.display = 'none'; });
-    $app.on('click', '#ni-e-report-restore', () => niEnrichRestoreFiltered());
+    // 报告弹窗按钮（关闭/恢复选中）由 niBindGlobalActions() 全局分发
     $app.on('click', '#ni-e-select-all', () => niEnrichSelectAll());
     $app.on('click', '#ni-e-select-invert', () => niEnrichSelectInvert());
     $app.on('click', '#ni-e-merge', () => niEnrichMergeSelected());
@@ -5487,9 +5593,7 @@ jQuery(async () => {
             q('#ni-e-fi')?.click();
         }
     });
-    $app.on('click', '#ni-e-detail-cancel', () => niEnrichCloseDetail());
-    $app.on('click', '#ni-e-detail-save', () => niEnrichSaveDetail());
-    $app.on('click', '#ni-e-detail-split', () => niEnrichSplitDetail());
+    // 详情弹窗按钮（取消/保存/拆分/生成/停止）由 niBindGlobalActions() 全局分发
     const _niEnrichThresholdEl = q('#ni-e-threshold');
     if (_niEnrichThresholdEl) _niEnrichThresholdEl.value = String(niEnrichCfg().threshold);
     niEnrichRenderList();
@@ -5721,12 +5825,18 @@ jQuery(async () => {
     });
     // 导出（P4）
     $app.on('click', '#ni-e-exp-btn', () => niEnrichExport());
-    $app.on('change', 'input[name="ni-e-api-mode"]', function () {
-        const usePreset = this.value === 'tavern';
-        niEnrichSaveApi({ useTavernPreset: usePreset });
-        niEnrichSyncTavernUI(usePreset);
-        if (usePreset) toastr?.info('已切换为跟随酒馆主预设：加料将使用酒馆当前预设提示词与 API 连接/模型');
-        else toastr?.info('已切换为独立 API 配置');
+    // API 来源（两个独立勾选，可同时勾选或同时取消）
+    $app.on('change', '#ni-e-api-tavern', function () {
+        const api = niEnrichApiCfg();
+        niEnrichSaveApi({ useTavernPreset: this.checked });
+        niEnrichSyncTavernUI(this.checked, api.useIndependentApi === true);
+        if (this.checked) toastr?.info('已开启使用酒馆主预设：加料将拼入酒馆当前预设提示词');
+    });
+    $app.on('change', '#ni-e-api-ind', function () {
+        const api = niEnrichApiCfg();
+        niEnrichSaveApi({ useIndependentApi: this.checked });
+        niEnrichSyncTavernUI(api.useTavernPreset === true, this.checked);
+        if (!this.checked && api.useTavernPreset !== true) toastr?.warning('两个来源都未勾选：加料时将提示选择 API 来源');
     });
     $app.on('change', '#ni-e-api-url', function () { niEnrichSaveApi({ url: this.value.trim() }); });
     $app.on('change', '#ni-e-api-key', function () { niEnrichSaveApi({ key: this.value }); });
@@ -5768,55 +5878,7 @@ jQuery(async () => {
     });
 
     // 详情弹窗：生成/停止加料（流式实时追加）
-    $app.on('click', '#ni-e-detail-enrich-btn', async function () {
-        if (!_niEnrichDetailId) return;
-        const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
-        const ch = chapters.find(c => c.id === _niEnrichDetailId);
-        if (!ch || !canEnrichChapter(ch)) { toastr?.warning('本章无加料资格（需判定为「是/存疑」或标记「通过」）'); return; }
-        const btn = this;
-        const stopBtn = q('#ni-e-detail-enrich-stop');
-        const ta = q('#ni-e-detail-enrich');
-        const stateEl = q('#ni-e-detail-enrich-state');
-        const controller = new AbortController();
-        _niEnrichDetailController = controller;
-        btn.disabled = true;
-        if (stopBtn) stopBtn.style.display = '';
-        if (ta) ta.value = '';
-        if (stateEl) stateEl.textContent = '生成中…';
-        try {
-            const result = await enrichChapter(ch, chapters.indexOf(ch), {
-                signal: controller.signal,
-                onDelta: delta => {
-                    if (ta) {
-                        ta.value += delta;
-                        ta.scrollTop = ta.scrollHeight;
-                    }
-                },
-            });
-            if (result?.noContent) toastr?.info('本章无可加料内容，已跳过（保留原文）');
-            else if (result?.short) toastr?.warning(`加料完成，但仅 ${result.charCount} 字（要求 ≥${ENRICH_MIN_CHARS} 字），建议重新生成`);
-            else toastr?.success(result.reviewed ? '加料完成' : '加料完成，但内容含敏感词，请人工审核');
-        } catch (err) {
-            if (err?.message !== 'AbortError') toastr?.error(`加料失败：${err?.message || err}`);
-        } finally {
-            btn.disabled = false;
-            if (stopBtn) stopBtn.style.display = 'none';
-            _niEnrichDetailController = null;
-            if (stateEl && ch.enrich) {
-                if (ch.enrich.noContent) {
-                    stateEl.textContent = '无加料（AI 判定原文无可加料内容，已保留原文）';
-                    if (ta) ta.value = '';
-                } else {
-                    if (ta) ta.value = ch.enrich.text || ''; // 流式显示的是原始回传，替换为回填后的加料版全文
-                    stateEl.textContent = niEnrichStateText(ch);
-                }
-            }
-            niEnrichRenderList();
-            niEnrichRenderStats();
-            niEnrichSyncButtons(false);
-        }
-    });
-    $app.on('click', '#ni-e-detail-enrich-stop', () => { _niEnrichDetailController?.abort(); });
+    // 详情弹窗生成/停止：已由 niBindGlobalActions() 全局分发（niEnrichDetailGenerate）
 
     // 加料 UI 初始化
     niEnrichSyncSettingsUI();
@@ -6024,10 +6086,7 @@ jQuery(async () => {
         }
     });
 
-    $app.on('click', '#ni-vec-debug-close', () => {
-        const modal = q('#ni-vec-debug-modal');
-        if (modal) modal.style.display = 'none';
-    });
+    // 向量诊断弹窗关闭按钮由 niBindGlobalActions() 全局分发；背景点击关闭保留
     $app.on('click', '#ni-vec-debug-modal', function(e) {
         if (e.target === this) this.style.display = 'none';
     });
@@ -7011,6 +7070,7 @@ jQuery(async () => {
     }, 800);
 
     console.log('[NI] 小说注入插件 加载完成');
+    console.log('[NI] 全局绑定状态: 导航=' + !!window._niNavbarGlobalBound + ', 弹窗动作=' + !!window._niGlobalActionsBound);
 
   } catch (err) {
     console.error('[NI] 初始化异常（导航已由全局绑定兜底，其余功能可能部分失效）:', err);
