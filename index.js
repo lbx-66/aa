@@ -174,7 +174,11 @@ import {
     BATCH_JUDGE_PROMPT,
     DEFAULT_JUDGE_PROMPT,
     DEFAULT_JUDGE_RULES,
+    LEGACY_BATCH_JUDGE_PROMPT,
+    LEGACY_BATCH_JUDGE_PROMPT_V2,
     LEGACY_JUDGE_PROMPT,
+    LEGACY_JUDGE_PROMPT_V2,
+    LEGACY_JUDGE_PROMPT_V3,
     buildBatchChaptersText,
     buildBatchJudgeMessages,
     buildJudgeMessages,
@@ -658,10 +662,17 @@ function niLoadSettings() {
     }
     niUpgradeLegacyTbDefaultPrompts(saved);
     if (niUpgradeRoleplayPrompt(saved)) saveSettingsDebounced();
-    // 判定提示词迁移：旧默认模板（"是否包含亲密描写"语义）→ 场景引擎缺口语义模板；
-    // 仅当模板从未被用户自定义（与旧默认逐字相等）时替换，自定义模板不动。
-    if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT) {
+    // 判定提示词迁移：历代默认模板（"是否包含亲密描写" / 场景缺口语义 / 性爱情节缺口语义）
+    // → 现行「六类线索+组合判定」模板；仅当模板从未被用户自定义（与旧默认逐字相等）时替换。
+    if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3) {
         saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+        saveSettingsDebounced();
+    }
+    if (saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2) {
+        saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
 
@@ -4653,7 +4664,7 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
         ? opts.sceneHint
         : (Array.isArray(ch?.judge?.scenes) ? ch.judge.scenes : []);
     if (scenes.length) {
-        rulesSummary += `\n【关键词初筛的场景窗口分析（供参考，可核实或反驳）】\n${buildScenesText(scenes)}`;
+        rulesSummary += `\n【关键词初筛的场景窗口分析（仅供参考，可核实或反驳）】\n${buildScenesText(scenes)}\n注意：初筛窗口只表示该区域命中了场景词，可能包含误报（如普通亲吻/拥抱/暧昧氛围、比喻用语、农田/战场等字面义隐喻词）。请按上方判定标准独立判断：只有确认为性爱情节且存在缺口才算「是」，普通亲密/纯爱互动一律「无缺口」。`;
     }
     const messages = buildJudgeMessages(template, {
         chapterContent: ch.text,
