@@ -1430,15 +1430,18 @@
         <div class="ni-desc" id="ni-j-stats" style="margin-bottom:6px"></div>
         <div class="ni-j-settings-panel" id="ni-j-settings">
           <div class="ni-j-cfg-group" id="ni-j-mode-group">
-            <label class="ni-j-cfg-lbl">判定模式
-              <select id="ni-j-mode">
-                <option value="keyword">仅关键词匹配（无需 API）</option>
-                <option value="hybrid">关键词初筛 + AI 精判可疑（推荐）</option>
-                <option value="ai">AI 深度分析（全部章节）</option>
+            <div class="ni-ctitle-label">判定引擎（并列勾选，至少一个）</div>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-engine-keyword" checked> 关键词判定（场景引擎，免费快速，无需 API）</label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-engine-ai"> AI 深度判定
+              <select id="ni-j-ai-scope" style="width:auto;max-width:240px">
+                <option value="suspicious">仅精判「可疑」章节（需配合关键词判定）</option>
+                <option value="all">判定全部章节</option>
               </select>
             </label>
-            <div class="ni-desc" style="margin:0 0 4px">混合模式：关键词快速判定（从宽——强信号词单出即「是」、部分命中标「可疑」、完全无命中为「否」），「开始判定」自动对可疑章节接 AI 精判；也可先「关键词初筛」查看，再点「AI 精判可疑」手动精判。</div>
-            <label class="ni-j-cfg-lbl">初筛阈值（从宽：强信号词单出即「是」，歧义词交 AI 精判）
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-engine-batch"> 批量场景扫描（AI，N章/次，独立运行）</label>
+            <div class="ni-desc" style="margin:0 0 4px">组合：仅关键词 = 免费快筛；仅 AI = 逐章深度分析；关键词 + AI = 先关键词初筛，再按范围 AI 精判（「仅可疑」推荐，省额度）；批量 = 按组打包扫描，不与关键词/AI 组合。</div>
+            <div class="ni-desc" style="margin:0 0 4px">关键词判定（场景引擎）：词库→阶段分类→场景窗口→补全决策，移植自 Auto Scene 3.5 判定逻辑——有可补全窗口→「是」、仅有场景无明确缺口→「可疑」、无场景→「否」、命中未成年/非自愿/多人男等→「安全否决」；「开始判定」按勾选组合自动执行，也可先「关键词初筛」查看，再点「AI 精判可疑」手动精判。</div>
+            <label class="ni-j-cfg-lbl">判定阈值（仅参与置信度换算；是/否/存疑/安全否决由场景窗口决策决定）
               <input type="number" id="ni-j-threshold" value="2" min="1" style="width:60px">
             </label>
           </div>
@@ -1447,15 +1450,25 @@
               <input type="number" id="ni-j-ai-threshold" value="0.6" min="0" max="1" step="0.05" style="width:64px">
             </label>
           </div>
+          <div class="ni-j-cfg-group" id="ni-j-batch-group" style="display:none">
+            <div class="ni-ctitle-label">批量场景扫描（一次调用判定 N 章）</div>
+            <label class="ni-j-cfg-lbl">每批章数
+              <input type="number" id="ni-j-batch-size" value="10" min="1" max="50" style="width:64px">
+            </label>
+            <div class="ni-desc" style="margin:2px 0 6px">「开始判定」时按此章数分组：本地场景引擎先提取每章场景窗口原文打包给 AI，AI 逐章标记「有缺口/无缺口/存疑/安全排除」；标记「是/存疑」的章节后续单独走 AI 加料。</div>
+            <div class="ni-ctitle-label">批量判定提示词模板</div>
+            <textarea id="ni-j-batch-prompt" class="ni-j-prompt-textarea" rows="8" spellcheck="false"></textarea>
+            <div class="ni-desc" style="margin:2px 0 0">变量：{chapters} 逐章场景材料、{rules} 规则摘要</div>
+          </div>
           <div class="ni-j-cfg-group" id="ni-j-feature-group">
-            <div class="ni-ctitle-label">初筛附加特征（可开关）</div>
+            <div class="ni-ctitle-label">旧引擎附加特征（场景引擎下不参与评分，仅兼容保留）</div>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-cooccur" checked> 共现窗口加分（场景词+动作词在 80 字内共现）</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-paragraph" checked> 段落峰值（单句密集命中 ≥3 词）</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-ellipsis" checked> 省略号/省略写法加分（……、（此处省略））</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-metaphor" checked> 比喻语境剔除（像…一样/仿佛…般 内的命中不算）</label>
           </div>
           <div class="ni-j-cfg-group" id="ni-j-kw-group">
-            <div class="ni-ctitle-label">关键词库（词 · 权重）</div>
+            <div class="ni-ctitle-label">关键词库（词 · 权重；仅作为 AI 精判的规则参考，不参与场景引擎评分）</div>
             <div id="ni-j-keywords"></div>
             <button class="ni-e-btn" id="ni-j-kw-add" style="margin-top:4px">＋ 添加关键词</button>
           </div>

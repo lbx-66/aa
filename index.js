@@ -171,8 +171,12 @@ import {
 } from './lib/api-system.js';
 
 import {
+    BATCH_JUDGE_PROMPT,
     DEFAULT_JUDGE_PROMPT,
     DEFAULT_JUDGE_RULES,
+    LEGACY_JUDGE_PROMPT,
+    buildBatchChaptersText,
+    buildBatchJudgeMessages,
     buildJudgeMessages,
     buildJudgeRulesSummary,
     classifyKeywordResult,
@@ -180,9 +184,17 @@ import {
     judgeResponseLength,
     judgeResultLabel,
     keywordJudgeToStore,
+    parseBatchJudgeResponse,
     parseJudgeResponse,
     scoreIntimacy,
 } from './lib/judge-system.js';
+
+import {
+    DEFAULT_SCENE_CONFIG,
+    buildAutoFemaleNames,
+    buildScenesText,
+    detectBookProfile,
+} from './lib/scene-system.js';
 
 import {
     DEFAULT_ENRICH_TEMPLATES,
@@ -390,8 +402,9 @@ const DEFAULT_SETTINGS = {
     enrichShortcutsEnabled: true, // 加料页快捷键（Space/S/Esc/Ctrl+I）
     // 亲密行为判定（P2）
     judgeRules: DEFAULT_JUDGE_RULES,       // 关键词库/正则/阈值（读取走 niJudgeRules 克隆，勿直接改）
-    judgePrompts: { template: DEFAULT_JUDGE_PROMPT },
+    judgePrompts: { template: DEFAULT_JUDGE_PROMPT, batchTemplate: BATCH_JUDGE_PROMPT },
     judgeApi: { url: '', key: '', model: '', stream: false, timeoutSec: 60, retries: 2, temperature: 0.3 },
+    sceneConfig: DEFAULT_SCENE_CONFIG,     // 场景引擎配置（判定逻辑移植自 Auto Scene 3.5 纯加料器.py）
     // AI 加料（P3）
     enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
     enrichTemplates: DEFAULT_ENRICH_TEMPLATES,  // 模板库（读取走 niEnrichTemplates 克隆）
@@ -640,6 +653,12 @@ function niLoadSettings() {
     }
     niUpgradeLegacyTbDefaultPrompts(saved);
     if (niUpgradeRoleplayPrompt(saved)) saveSettingsDebounced();
+    // 判定提示词迁移：旧默认模板（"是否包含亲密描写"语义）→ 场景引擎缺口语义模板；
+    // 仅当模板从未被用户自定义（与旧默认逐字相等）时替换，自定义模板不动。
+    if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT) {
+        saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+        saveSettingsDebounced();
+    }
 
     // 还原轻量运行状态与当前小说标识；持久化阶段索引由独立 stages 文件加载
     if (saved._stageStates) S.stageStates = saved._stageStates;
@@ -3757,6 +3776,11 @@ function niEnrichStatusBadge(ch) {
     if (st === CHAPTER_STATUS.JUDGED && ch?.judge?.hybridPending) {
         return `<span class="ni-e-stat ni-es-q" title="关键词部分命中，待 AI 精判">可疑</span>`;
     }
+    // 场景引擎：安全否决（未成年/非自愿/多人男/排除名单等），不可自动加料
+    if (st === CHAPTER_STATUS.JUDGED && ch?.judge?.result === 'vetoed') {
+        const reasons = (ch.judge.safety?.vetoReasons || []).join('；');
+        return `<span class="ni-e-stat ni-es-e" title="安全否决：${niEscAttr(reasons || ch.judge.evidence || '')}。不可自动加料，可在详情中人工标记后处理">安全否决</span>`;
+    }
     let cls = 'ni-es-w';
     if (st === CHAPTER_STATUS.DETECTING || st === CHAPTER_STATUS.ENRICHING) cls = 'ni-es-r';
     else if (st === CHAPTER_STATUS.JUDGED || st === CHAPTER_STATUS.ENRICHED) cls = 'ni-es-d';
@@ -3995,7 +4019,14 @@ function niEnrichOpenDetail(id) {
     if (evEl) {
         if (ch.judge) {
             evEl.style.display = '';
-            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)} · 置信度 ${ch.judge.confidence ?? '-'}（${ch.judge.mode === 'ai' ? 'AI 分析' : ch.judge.mode === 'manual' ? '手动标记' : '关键词匹配'}）\n依据：${ch.judge.evidence || '—'}`;
+            const modeText = ch.judge.mode === 'ai' ? 'AI 分析'
+                : ch.judge.mode === 'batch' ? '批量场景扫描'
+                : ch.judge.mode === 'manual' ? '手动标记'
+                : '场景引擎';
+            const vetoHint = ch.judge.result === 'vetoed'
+                ? '\n安全否决：该章不可自动加料。可在下方人工标记后手动处理。'
+                : '';
+            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}`;
         } else if (ch.error) {
             evEl.style.display = '';
             evEl.textContent = `上次处理失败：${ch.error}\n可在列表中点「重判」或工具栏「重判失败」重试（AI 返回被截断时会自动放大输出上限重试）。`;
@@ -4471,18 +4502,62 @@ function niJudgeSaveApi(patch) {
     saveSettingsDebounced?.();
 }
 
-/** AI 深度判定单个章节（含截断放大重试）；供纯 AI 模式与混合模式的精判阶段使用。 */
-async function aiJudgeChapter(ch, rules, signal) {
-    const api = niJudgeApiCfg();
-    if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
-    const template = extension_settings[EXT_NAME]?.judgePrompts?.template || DEFAULT_JUDGE_PROMPT;
-    const messages = buildJudgeMessages(template, {
-        chapterContent: ch.text,
-        rulesSummary: buildJudgeRulesSummary(rules),
+// —— 场景引擎配置与全书级缓存（判定逻辑移植自 Auto Scene 3.5 纯加料器.py）——
+
+/** 场景引擎配置（深拷贝合并，读取走此函数，勿直接改设置对象）。 */
+function niSceneConfig() {
+    const base = {
+        ...DEFAULT_SCENE_CONFIG,
+        female_names: [...(DEFAULT_SCENE_CONFIG.female_names || [])],
+        excluded_names: [...(DEFAULT_SCENE_CONFIG.excluded_names || [])],
+        adult_female_allowlist: [...(DEFAULT_SCENE_CONFIG.adult_female_allowlist || [])],
+        allowed_chapter_ranges: [...(DEFAULT_SCENE_CONFIG.allowed_chapter_ranges || [])],
+        aliases: { ...(DEFAULT_SCENE_CONFIG.aliases || {}) },
+    };
+    const saved = extension_settings[EXT_NAME]?.sceneConfig;
+    return saved && typeof saved === 'object' ? { ...base, ...saved } : base;
+}
+
+let _niBookProfileCache = null;
+let _niBookProfileSig = '';
+/** 全书 R18 画像（high_r18/normal），按章节数量+字数签名缓存，章节内容变化自动失效。 */
+function niGetBookProfile() {
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
+    const sig = `${chapters.length}|${chapters.map(c => c?.charCount || 0).join(',')}`;
+    if (_niBookProfileSig === sig && _niBookProfileCache) return _niBookProfileCache;
+    _niBookProfileCache = detectBookProfile(chapters.map(c => c?.text || ''), niSceneConfig());
+    _niBookProfileSig = sig;
+    return _niBookProfileCache;
+}
+
+let _niAutoNamesCache = null;
+let _niAutoNamesSig = '';
+/** 全书自动女主名单（供窗口模式识别），按同样签名缓存。 */
+function niGetAutoNames() {
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
+    const sig = `${chapters.length}|${chapters.map(c => c?.charCount || 0).join(',')}`;
+    if (_niAutoNamesSig === sig && _niAutoNamesCache) return _niAutoNamesCache;
+    const cfg = niSceneConfig();
+    _niAutoNamesCache = cfg.auto_extract_female_names === false
+        ? []
+        : buildAutoFemaleNames(chapters.map(c => c?.text || '').join('\n'), cfg);
+    _niAutoNamesSig = sig;
+    return _niAutoNamesCache;
+}
+
+/** 关键词模式场景评分（带全书画像/配置/自动名单上下文）。 */
+function niScoreChapter(ch) {
+    return scoreIntimacy(ch?.text || '', niJudgeRules(), {
+        sceneConfig: niSceneConfig(),
+        bookProfile: niGetBookProfile().profile,
+        chapterNumber: ch?.index || 0,
+        autoNames: niGetAutoNames(),
     });
+}
+
+/** 判定 API 调用（含截断放大重试）；供逐章 AI 判定与批量场景扫描共用。 */
+async function niJudgeCallRetry(messages, api, signal, { baseLength = 800 } = {}) {
     const retries = Math.max(0, Number(api.retries) || 0);
-    // 截断时自动放大输出上限：800 → 1600 → 3200 …（封顶 8000）
-    const baseLength = 800;
     let truncatedCount = 0;
     let raw = '';
     let lastErr = null;
@@ -4490,7 +4565,7 @@ async function aiJudgeChapter(ch, rules, signal) {
         if (signal?.aborted) throw new Error('AbortError');
         try {
             raw = await niJudgeCall(messages, { responseLength: judgeResponseLength(truncatedCount, baseLength), signal });
-            break;
+            return raw;
         } catch (err) {
             if (signal?.aborted || err?.message === 'AbortError') throw err;
             lastErr = err;
@@ -4501,7 +4576,30 @@ async function aiJudgeChapter(ch, rules, signal) {
             if (attempt < retries) await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
         }
     }
-    if (!raw) throw lastErr || new Error('判定 API 无返回内容');
+    throw lastErr || new Error('判定 API 无返回内容');
+}
+
+/** AI 深度判定单个章节（含截断放大重试）；供纯 AI 模式与混合模式的精判阶段使用。
+ *  opts.sceneHint：关键词初筛的场景窗口明细（混合模式自动精判时传入，此时 ch.judge 尚未落库）；
+ *  精判阶段（ch.judge 已有初筛结果）自动读取 ch.judge.scenes。
+ */
+async function aiJudgeChapter(ch, rules, signal, opts = {}) {
+    const api = niJudgeApiCfg();
+    if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
+    const template = extension_settings[EXT_NAME]?.judgePrompts?.template || DEFAULT_JUDGE_PROMPT;
+    let rulesSummary = buildJudgeRulesSummary(rules);
+    // 注入初筛的场景窗口分析，让 AI 精判可核实/反驳，避免两阶段结论打架
+    const scenes = Array.isArray(opts.sceneHint)
+        ? opts.sceneHint
+        : (Array.isArray(ch?.judge?.scenes) ? ch.judge.scenes : []);
+    if (scenes.length) {
+        rulesSummary += `\n【关键词初筛的场景窗口分析（供参考，可核实或反驳）】\n${buildScenesText(scenes)}`;
+    }
+    const messages = buildJudgeMessages(template, {
+        chapterContent: ch.text,
+        rulesSummary,
+    });
+    const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 800 });
     const parsed = parseJudgeResponse(raw);
     const isDoubt = parsed.confidence < (Number(rules.aiThreshold) || 0.6);
     return {
@@ -4509,8 +4607,78 @@ async function aiJudgeChapter(ch, rules, signal) {
         confidence: parsed.confidence,
         evidence: parsed.evidence,
         mode: 'ai',
+        scenes: scenes.slice(), // 附带初筛场景窗口明细（详情/后续加料参考）
         at: Date.now(),
     };
+}
+
+/**
+ * 批量场景扫描（一次 AI 调用判定一组章节，默认 10 章/组）：
+ * 本地场景引擎先为每章提取场景窗口原文 → 打包成材料 → AI 逐章标记 has_gap →
+ * 写回每章 judge（本地安全否决优先；AI 遗漏章节回退本地初筛结论）。
+ * 标记「是/存疑」的章节后续单独走原 AI 加料流程。
+ */
+async function judgeChapterBatch(group, { signal = null } = {}) {
+    const list = (Array.isArray(group) ? group : [group]).filter(ch => ch && ch.text);
+    if (!list.length) return;
+    const rules = niJudgeRules();
+    const api = niJudgeApiCfg();
+    if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
+    const sceneCfg = niSceneConfig();
+    const bookProfile = niGetBookProfile().profile;
+    const autoNames = niGetAutoNames();
+    const aiThreshold = Number(rules.aiThreshold) || 0.6;
+
+    // 本地场景引擎初筛（窗口明细/安全否决；AI 遗漏章节时回退）
+    const local = new Map();
+    for (const ch of list) local.set(ch.index, niScoreChapter(ch));
+
+    const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
+    const chaptersText = buildBatchChaptersText(list, {
+        sceneConfig: sceneCfg,
+        bookProfile,
+        autoNames,
+        maxCharsPerChapter: Number(sceneCfg.batch_max_chars_per_chapter) || 1200,
+    });
+    const messages = buildBatchJudgeMessages(template, {
+        chaptersText,
+        rulesSummary: buildJudgeRulesSummary(rules),
+    });
+    const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 2000 });
+    const byIndex = parseBatchJudgeResponse(raw);
+
+    for (const ch of list) {
+        const scored = local.get(ch.index) || niScoreChapter(ch);
+        // 本地安全否决优先（词表直接命中，比 AI 可靠）
+        if (scored.vetoed) {
+            ch.judge = { ...keywordJudgeToStore(scored), result: 'vetoed', hybridPending: false, at: Date.now() };
+        } else {
+            const res = byIndex.get(ch.index);
+            if (!res) {
+                // AI 遗漏该章：回退本地初筛结论
+                const cls = classifyKeywordResult(scored);
+                ch.judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
+            } else {
+                const isDoubt = res.confidence < aiThreshold;
+                ch.judge = {
+                    result: isDoubt ? 'doubt' : res.result,
+                    confidence: res.confidence,
+                    evidence: res.evidence || scored.evidence,
+                    mode: 'batch',
+                    scenes: scored.scenes,
+                    safety: scored.safety,
+                    bookProfile: scored.bookProfile,
+                    modes: scored.modes,
+                    score: scored.score,
+                    hitCount: scored.hitCount,
+                    at: Date.now(),
+                };
+            }
+        }
+        delete ch.error;
+        transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+    }
+    niEnrichScheduleSave();
 }
 
 /**
@@ -4535,21 +4703,24 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
             // 精判阶段：直接 AI，覆盖之前的可疑标记与关键词结果
             judge = await aiJudgeChapter(ch, rules, signal);
         } else if (keywordOnly) {
-            // 关键词初筛：三分类（强命中→是、部分命中→可疑、无命中→否），
-            // 可疑章节带 hybridPending 标记，供「AI 精判可疑」收集
-            const scored = scoreIntimacy(ch.text, rules);
+            // 关键词初筛（场景引擎）：四分类（有可补全窗口→是、仅场景无缺口→可疑、
+            // 无场景→否、安全否决→安全否决），可疑章节带 hybridPending 标记，供「AI 精判可疑」收集
+            const scored = niScoreChapter(ch);
             const cls = classifyKeywordResult(scored);
             judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
         } else if (rules.mode === 'keyword') {
-            // 纯关键词模式：直接 是/否 判定，不产生可疑标记
-            judge = keywordJudgeToStore(scoreIntimacy(ch.text, rules));
-        } else if (rules.mode === 'hybrid') {
-            // 混合模式：关键词三分类，可疑章节自动级联 AI 精判（"开始判定"全自动两阶段）
-            const scored = scoreIntimacy(ch.text, rules);
+            // 纯关键词模式（场景引擎）：直接 是/否/安全否决 判定，不产生可疑标记
+            judge = keywordJudgeToStore(niScoreChapter(ch));
+        } else if (rules.mode === 'hybrid' || rules.mode === 'hybrid_all') {
+            // 关键词 + AI 组合：先关键词初筛；
+            //  - hybrid：仅可疑章节自动级联 AI 精判（"开始判定"全自动两阶段，推荐）
+            //  - hybrid_all：初筛后全部章节 AI 精判（覆盖初筛结果）
+            const scored = niScoreChapter(ch);
             const cls = classifyKeywordResult(scored);
             judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
-            if (judge.hybridPending) {
-                judge = await aiJudgeChapter(ch, rules, signal);
+            if (rules.mode === 'hybrid_all' || judge.hybridPending) {
+                // 传入初筛窗口明细，AI 精判可核实/反驳
+                judge = await aiJudgeChapter(ch, rules, signal, { sceneHint: scored.scenes });
             }
         } else {
             judge = await aiJudgeChapter(ch, rules, signal);
@@ -4570,6 +4741,7 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
 }
 
 let niJudgeQueueCreated = false;
+let niJudgeBatchQueueCreated = false;
 // 混合模式运行期标志：AI 精判阶段 / 仅关键词初筛阶段（由对应按钮设置，队列结束时清除）
 let _niJudgeRefinePass = false;
 let _niJudgeKeywordPass = false;
@@ -4580,23 +4752,59 @@ function niJudgeQueueEligible(ch) {
     return [CHAPTER_STATUS.UNDETECTED, CHAPTER_STATUS.FAILED, CHAPTER_STATUS.SKIPPED].includes(ch.status);
 }
 
+/** 批量模式：把待判定章节按每批章数分组（每组 = 队列一项，一次 AI 调用）。 */
+function niJudgeBatchGroups() {
+    const chapters = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).filter(niJudgeQueueEligible);
+    const batchSize = Math.max(1, Number(niSceneConfig().batch_chapters_per_call) || 10);
+    const groups = [];
+    for (let i = 0; i < chapters.length; i += batchSize) {
+        groups.push(chapters.slice(i, i + batchSize));
+    }
+    return groups;
+}
+
+function niForEachGroupItem(item, fn) {
+    (Array.isArray(item) ? item : [item]).forEach(fn);
+}
+
+/** 判定队列按当前模式分发：batch → 分组批量队列；其余 → 逐章队列。 */
 function niJudgeEnsureQueue() {
-    if (niJudgeQueueCreated) return niJudgeQueue;
-    niJudgeQueueCreated = true;
-    niJudgeQueue = createBatchQueueController({
-        getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
-        isEligible: niJudgeQueueEligible,
-        processItem: judgeChapter,
-        setProcessingStatus: ch => { if (ch) ch.status = CHAPTER_STATUS.DETECTING; },
-        setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
-        setFailedStatus: ch => { if (ch && ch.status !== CHAPTER_STATUS.JUDGED) { ch.status = CHAPTER_STATUS.FAILED; niEnrichScheduleSave(); } },
-        resetStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.UNDETECTED; niEnrichScheduleSave(); } },
-        concurrency: () => 1,
-        onProgress: niJudgeOnProgress,
-        persist: () => niEnrichScheduleSave({ immediate: true }),
-    });
+    const isBatch = niJudgeRules().mode === 'batch';
+    if (isBatch ? niJudgeBatchQueueCreated : niJudgeQueueCreated) return niJudgeQueue;
+    if (isBatch) niJudgeBatchQueueCreated = true; else niJudgeQueueCreated = true;
+    niJudgeQueue = isBatch
+        ? createBatchQueueController({
+            getItems: niJudgeBatchGroups,
+            isEligible: item => Array.isArray(item) && item.length > 0,
+            processItem: judgeChapterBatch,
+            setProcessingStatus: item => niForEachGroupItem(item, ch => { if (ch) ch.status = CHAPTER_STATUS.DETECTING; }),
+            setSkippedStatus: item => niForEachGroupItem(item, ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } }),
+            setFailedStatus: item => niForEachGroupItem(item, ch => { if (ch && ch.status !== CHAPTER_STATUS.JUDGED) { ch.status = CHAPTER_STATUS.FAILED; niEnrichScheduleSave(); } }),
+            resetStatus: item => niForEachGroupItem(item, ch => { if (ch) { ch.status = CHAPTER_STATUS.UNDETECTED; niEnrichScheduleSave(); } }),
+            concurrency: () => 1,
+            onProgress: niJudgeOnProgress,
+            persist: () => niEnrichScheduleSave({ immediate: true }),
+        })
+        : createBatchQueueController({
+            getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
+            isEligible: niJudgeQueueEligible,
+            processItem: judgeChapter,
+            setProcessingStatus: ch => { if (ch) ch.status = CHAPTER_STATUS.DETECTING; },
+            setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
+            setFailedStatus: ch => { if (ch && ch.status !== CHAPTER_STATUS.JUDGED) { ch.status = CHAPTER_STATUS.FAILED; niEnrichScheduleSave(); } },
+            resetStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.UNDETECTED; niEnrichScheduleSave(); } },
+            concurrency: () => 1,
+            onProgress: niJudgeOnProgress,
+            persist: () => niEnrichScheduleSave({ immediate: true }),
+        });
     niSetBatchQueues({ judge: niJudgeQueue });
     return niJudgeQueue;
+}
+
+/** 当前生效的判定队列（暂停/跳过/取消/重判用；避免模式切换时拿到未创建的实例）。 */
+function niJudgeActiveQueue() {
+    if (niJudgeRules().mode === 'batch') return niJudgeQueue || niJudgeEnsureQueue();
+    return niJudgeQueue || niJudgeEnsureQueue();
 }
 
 function niJudgeOnProgress(p) {
@@ -4618,9 +4826,11 @@ function niJudgeOnProgress(p) {
     }
 }
 
-/** 关键词初筛（免费快速）：全部分类为 是/否/可疑（部分命中标记 hybridPending，不调用 AI）。 */
+/** 关键词初筛（免费快速）：全部分类为 是/否/可疑/安全否决（部分命中标记 hybridPending，不调用 AI）。 */
 function niJudgeKeywordScan() {
     if (niJudgeQueue?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
+    const mode = niJudgeRules().mode;
+    if (mode === 'batch' || mode === 'ai') { toastr?.warning('当前组合没有关键词初筛环节，请勾选「关键词判定」引擎'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const targets = chapters.filter(ch => niJudgeQueueEligible(ch));
     if (!targets.length) { toastr?.info('没有待判定的章节'); return; }
@@ -4635,7 +4845,7 @@ function niJudgeAiRefine() {
     const targets = chapters.filter(ch => ch.judge?.hybridPending);
     if (!targets.length) { toastr?.info('没有可疑章节需要 AI 精判'); return; }
     const mode = niJudgeRules().mode;
-    if (mode === 'keyword') { toastr?.warning('当前是「仅关键词」模式，请切换到「AI 深度分析」或「关键词+AI 精判」模式'); return; }
+    if (mode === 'keyword' || mode === 'batch') { toastr?.warning('当前组合没有 AI 精判环节，请勾选「AI 深度判定」引擎'); return; }
     _niJudgeRefinePass = true;
     niJudgeEnsureQueue()?.run();
 }
@@ -4685,17 +4895,19 @@ function niJudgeSyncButtons(running) {
         if (skipBtn) skipBtn.style.display = 'none';
         if (cancelBtn) cancelBtn.style.display = 'none';
         const hasChapters = Array.isArray(S.enrichChapters) && S.enrichChapters.length > 0;
+        const mode = niJudgeRules().mode;
+        const batchMode = mode === 'batch';
         if (retryBtn) {
             const failedCount = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).filter(ch => ch.status === CHAPTER_STATUS.FAILED).length;
             retryBtn.style.display = failedCount > 0 ? 'inline-flex' : 'none';
             retryBtn.textContent = failedCount > 0 ? `重判失败(${failedCount})` : '重判失败';
         }
         if (reallBtn) reallBtn.style.display = hasChapters ? 'inline-flex' : 'none';
-        if (scanBtn) scanBtn.style.display = hasChapters ? 'inline-flex' : 'none';
+        // 纯 AI / 批量模式：无关键词初筛环节，隐藏「关键词初筛」；批量模式再隐藏「AI 精判可疑」
+        if (scanBtn) scanBtn.style.display = hasChapters && !batchMode && mode !== 'ai' ? 'inline-flex' : 'none';
         if (refineBtn) {
             const suspicious = niJudgeSuspiciousCount();
-            const mode = niJudgeRules().mode;
-            refineBtn.style.display = suspicious > 0 && mode !== 'keyword' ? 'inline-flex' : 'none';
+            refineBtn.style.display = suspicious > 0 && mode !== 'keyword' && mode !== 'batch' ? 'inline-flex' : 'none';
             refineBtn.textContent = suspicious > 0 ? `AI 精判可疑(${suspicious})` : 'AI 精判可疑';
         }
     }
@@ -4703,7 +4915,7 @@ function niJudgeSyncButtons(running) {
 
 /** 只把失败的章节重置并重新判定（不碰已判定/跳过的）。 */
 function niJudgeRejudgeFailed() {
-    if (niJudgeQueue?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
+    if (niJudgeActiveQueue()?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const targets = chapters.filter(ch => ch.status === CHAPTER_STATUS.FAILED);
     if (!targets.length) { toastr?.info('没有失败的章节'); return; }
@@ -4758,18 +4970,50 @@ function niJudgeReadRulesFromUI() {
     return rules;
 }
 
-function niJudgeSyncModeUI() {
-    const mode = String(q('#ni-j-mode')?.value || 'keyword');
+/** 引擎勾选 → 判定模式（关键词/AI 并列组合）：
+ *  仅关键词→keyword；仅 AI→ai；关键词+AI(仅可疑)→hybrid；关键词+AI(全部)→hybrid_all；批量→batch。 */
+function niJudgeModeFromEngines() {
+    const kw = q('#ni-j-engine-keyword')?.checked === true;
+    const ai = q('#ni-j-engine-ai')?.checked === true;
+    const batch = q('#ni-j-engine-batch')?.checked === true;
+    const scope = String(q('#ni-j-ai-scope')?.value || 'all');
+    if (batch) return 'batch';
+    if (kw && ai) return scope === 'suspicious' ? 'hybrid' : 'hybrid_all';
+    if (ai) return 'ai';
+    return 'keyword';
+}
+
+/** 判定模式 → 引擎勾选状态（AI 单独勾选时 AI 范围强制「全部」且禁用）。 */
+function niJudgeSyncEngineUI(mode) {
+    const m = mode || 'keyword';
+    const kw = q('#ni-j-engine-keyword');
+    const ai = q('#ni-j-engine-ai');
+    const batch = q('#ni-j-engine-batch');
+    const scope = q('#ni-j-ai-scope');
+    if (kw) kw.checked = m === 'keyword' || m === 'hybrid' || m === 'hybrid_all';
+    if (ai) ai.checked = m === 'ai' || m === 'hybrid' || m === 'hybrid_all';
+    if (batch) batch.checked = m === 'batch';
+    if (scope) {
+        scope.value = m === 'hybrid' ? 'suspicious' : 'all';
+        scope.disabled = ai?.checked === true && kw?.checked !== true;
+    }
+}
+
+function niJudgeSyncModeUI(mode) {
+    const m = mode || niJudgeModeFromEngines() || 'keyword';
+    niJudgeSyncEngineUI(m);
     const aiGroup = q('#ni-j-ai-group');
-    if (aiGroup) aiGroup.style.display = mode === 'ai' || mode === 'hybrid' ? '' : 'none';
+    if (aiGroup) aiGroup.style.display = m === 'ai' || m === 'hybrid' || m === 'hybrid_all' || m === 'batch' ? '' : 'none';
     const kwGroup = q('#ni-j-kw-group');
-    if (kwGroup) kwGroup.style.display = mode === 'keyword' || mode === 'hybrid' ? '' : 'none';
+    if (kwGroup) kwGroup.style.display = m === 'keyword' || m === 'hybrid' || m === 'hybrid_all' ? '' : 'none';
+    const batchGroup = q('#ni-j-batch-group');
+    if (batchGroup) batchGroup.style.display = m === 'batch' ? '' : 'none';
 }
 
 function niJudgeSyncSettingsUI() {
     const rules = niJudgeRules();
     const api = niJudgeApiCfg();
-    sv('#ni-j-mode', rules.mode || 'keyword');
+    niJudgeSyncEngineUI(rules.mode || 'keyword');
     sv('#ni-j-threshold', rules.threshold ?? 3);
     sv('#ni-j-ai-threshold', rules.aiThreshold ?? 0.6);
     sv('#ni-j-api-url', api.url || '');
@@ -4781,6 +5025,10 @@ function niJudgeSyncSettingsUI() {
     sv('#ni-j-api-retries', api.retries ?? 2);
     const ptEl = q('#ni-j-prompt');
     if (ptEl) ptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.template || DEFAULT_JUDGE_PROMPT;
+    // 批量场景扫描：每批章数 + 批量模板
+    sv('#ni-j-batch-size', niSceneConfig().batch_chapters_per_call ?? 10);
+    const bptEl = q('#ni-j-batch-prompt');
+    if (bptEl) bptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
     // 附加特征开关
     const feat = rules.features || {};
     const fEl = (id, val) => { const el = q(id); if (el) el.checked = val !== false; };
@@ -4795,7 +5043,7 @@ function niJudgeSyncSettingsUI() {
 
 /** 批量重新判定：重置所有非处理中章节为未判定并重跑（覆盖已判定/失败/跳过）。 */
 function niJudgeRejudgeAll() {
-    if (niJudgeQueue?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
+    if (niJudgeActiveQueue()?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const targets = chapters.filter(ch => !ch.filtered && ![CHAPTER_STATUS.DETECTING, CHAPTER_STATUS.ENRICHING].includes(ch.status));
     if (!targets.length) { toastr?.warning('没有可重新判定的章节'); return; }
@@ -5615,19 +5863,32 @@ jQuery(async () => {
     // ── 判定卡片 ──
     $app.on('click', '#ni-j-cfg-btn', () => niTogglePanel('ni-j-settings', 'ni-j-cfg-btn'));
     $app.on('click', '#ni-btn-judge', () => { niJudgeEnsureQueue()?.run(); });
-    $app.on('click', '#ni-btn-judge-pause', () => niJudgeQueue?.pause());
-    $app.on('click', '#ni-btn-judge-skip', () => niJudgeQueue?.skipCurrent());
-    $app.on('click', '#ni-btn-judge-cancel', () => niJudgeQueue?.cancelAll());
+    $app.on('click', '#ni-btn-judge-pause', () => niJudgeActiveQueue()?.pause());
+    $app.on('click', '#ni-btn-judge-skip', () => niJudgeActiveQueue()?.skipCurrent());
+    $app.on('click', '#ni-btn-judge-cancel', () => niJudgeActiveQueue()?.cancelAll());
     $app.on('click', '#ni-btn-judge-retry', () => niJudgeRejudgeFailed());
     $app.on('click', '#ni-btn-judge-reall', () => niJudgeRejudgeAll());
     $app.on('click', '#ni-btn-judge-scan', () => niJudgeKeywordScan());
     $app.on('click', '#ni-btn-judge-refine', () => niJudgeAiRefine());
     $app.on('click', '#ni-btn-judge-csv', () => niJudgeExportCsv());
 
-    // 判定模式与阈值
-    $app.on('change', '#ni-j-mode', function () {
-        niJudgeSaveRules({ mode: this.value });
-        niJudgeSyncModeUI();
+    // 判定引擎（并列勾选：关键词/AI/批量）
+    $app.on('change', '#ni-j-engine-keyword, #ni-j-engine-ai, #ni-j-engine-batch, #ni-j-ai-scope', function () {
+        const anyEngine = q('#ni-j-engine-keyword')?.checked || q('#ni-j-engine-ai')?.checked || q('#ni-j-engine-batch')?.checked;
+        if (!anyEngine) {
+            toastr?.warning('至少勾选一个判定引擎，已恢复「关键词判定」');
+            niJudgeSaveRules({ mode: 'keyword' });
+            niJudgeSyncModeUI('keyword');
+            niJudgeSyncButtons(false);
+            return;
+        }
+        if (niJudgeQueue?.isRunning?.()) {
+            toastr?.warning('判定队列运行中，新组合将在下次「开始判定」时生效；如需立即生效请先暂停');
+        }
+        const mode = niJudgeModeFromEngines();
+        niJudgeSaveRules({ mode });
+        niJudgeSyncModeUI(mode);
+        niJudgeSyncButtons(false);
     });
     $app.on('change', '#ni-j-threshold', function () {
         niJudgeSaveRules({ threshold: Math.max(0, parseInt(this.value, 10) || 0) });
@@ -5701,7 +5962,7 @@ jQuery(async () => {
             if (Array.isArray(obj.regexes)) {
                 next.regexes = obj.regexes.filter(r => r?.pattern).map(r => ({ pattern: String(r.pattern), weight: Number(r.weight) || 0 }));
             }
-            if (obj.mode === 'ai' || obj.mode === 'keyword') next.mode = obj.mode;
+            if (['ai', 'keyword', 'hybrid', 'hybrid_all', 'batch'].includes(obj.mode)) next.mode = obj.mode;
             if (Number(obj.threshold) > 0) next.threshold = Number(obj.threshold);
             if (Number(obj.aiThreshold) >= 0) next.aiThreshold = Number(obj.aiThreshold);
             niJudgeSaveRules(next);
@@ -5722,6 +5983,16 @@ jQuery(async () => {
     $app.on('change', '#ni-j-prompt', function () {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
         cfg.judgePrompts = { ...(cfg.judgePrompts || {}), template: this.value };
+        saveSettingsDebounced?.();
+    });
+    $app.on('change', '#ni-j-batch-size', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.sceneConfig = { ...niSceneConfig(), batch_chapters_per_call: Math.max(1, Math.min(50, parseInt(this.value, 10) || 10)) };
+        saveSettingsDebounced?.();
+    });
+    $app.on('change', '#ni-j-batch-prompt', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.judgePrompts = { ...(cfg.judgePrompts || {}), batchTemplate: this.value };
         saveSettingsDebounced?.();
     });
     $app.on('click', '#ni-j-api-models', async () => {
