@@ -1499,6 +1499,9 @@
             <label class="ni-j-cfg-lbl">流式输出 <input type="checkbox" id="ni-j-api-stream"></label>
             <label class="ni-j-cfg-lbl">超时（秒）<input type="number" id="ni-j-api-timeout" value="60" min="5" style="width:64px"></label>
             <label class="ni-j-cfg-lbl">重试次数 <input type="number" id="ni-j-api-retries" value="2" min="0" max="10" style="width:64px"></label>
+            <label class="ni-j-cfg-lbl">并发请求数 <input type="number" id="ni-j-concurrency" value="1" min="1" max="16" style="width:64px"></label>
+            <label class="ni-j-cfg-lbl">每分钟限速 <input type="number" id="ni-j-rate-limit" value="0" min="0" max="600" style="width:64px"> 次（0=不限）</label>
+            <div class="ni-desc" style="margin:2px 0 0">并发数：同时进行的判定请求数（1=串行）。判定与清洗/加料互不影响；调大后注意 API 限流（429）。</div>
           </div>
           <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">判定提示词模板（AI 模式）</div>
@@ -1549,7 +1552,7 @@
             <div class="ni-ctitle-label">提示词模板</div>
             <textarea id="ni-e-tpl-prompt" class="ni-j-prompt-textarea" rows="8" spellcheck="false"></textarea>
             <div class="ni-desc" style="margin:2px 0 0">变量：{chapter_content} 原文（超长自动截断）、{keywords} 判定依据、{style} 风格、{intensity} 强度说明、{no_marker} 无加料标记、{min_chars} 最低字数</div>
-            <div class="ni-desc" style="margin:2px 0 0">输出规范（自动追加，不可关闭）：AI 只输出「加料后的情节」段落（不整章重写、不重复原文）；原文无可加料内容时只输出「无加料」标记（该章保留原文并标记跳过）；加料内容不少于 2000 字。</div>
+            <div class="ni-desc" style="margin:2px 0 0">输出规范（自动追加，不可关闭）：AI 只输出「加料后的情节」段落（不整章重写、不重复原文）；原文无可加料内容时只输出「无加料」标记（该章保留原文并标记跳过）；加料内容不少于下方「最低字数」。</div>
             <div class="ni-tool-row" style="margin-top:4px">
               <button class="ni-e-btn" id="ni-e-tpl-new">新建模板</button>
               <button class="ni-e-btn" id="ni-e-tpl-del">删除当前</button>
@@ -1560,6 +1563,8 @@
             <div class="ni-ctitle-label">生成参数</div>
             <label class="ni-j-cfg-lbl">最大输出长度 <input type="number" id="ni-e-max-tokens" value="4000" min="256" max="8000" step="100" style="width:84px"> tokens（手动兜底值）</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-max-auto" checked> 按模型最大值自动设定（优先取模型列表的 max_tokens；列表无信息时查内置常见模型表；均无时回退上方手动值）</label>
+            <label class="ni-j-cfg-lbl">最低字数 <input type="number" id="ni-e-min-chars" value="2000" min="0" step="100" style="width:84px"> 字（写入提示词与输出规范）</label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-enforce-min" checked> 强制达标：不足最低字数时自动追加一轮扩写；仍不足则标记失败（保留内容可重试），不再产出"短成品"</label>
           </div>
           <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">安全过滤</div>
@@ -1590,6 +1595,9 @@
             <label class="ni-j-cfg-lbl">超时（秒）<input type="number" id="ni-e-api-timeout" value="120" min="5" style="width:64px"></label>
             <label class="ni-j-cfg-lbl">重试次数 <input type="number" id="ni-e-api-retries" value="2" min="0" max="10" style="width:64px"></label>
             <label class="ni-j-cfg-lbl">每日调用限额 <input type="number" id="ni-e-api-quota" value="0" min="0" style="width:80px"> 次（0=不限；今日已用 <span id="ni-e-api-quota-used">0</span>）</label>
+            <label class="ni-j-cfg-lbl">并发请求数 <input type="number" id="ni-e-concurrency" value="1" min="1" max="8" style="width:64px"></label>
+            <label class="ni-j-cfg-lbl">每分钟限速 <input type="number" id="ni-e-rate-limit" value="0" min="0" max="600" style="width:64px"> 次（0=不限）</label>
+            <div class="ni-desc" style="margin:2px 0 0">并发数：同时进行的加料请求数（1=串行）。加料与清洗/判定互不影响；调大后注意 API 限流（429）。</div>
           </div>
         </div>
       </div>

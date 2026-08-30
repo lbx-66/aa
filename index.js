@@ -201,6 +201,7 @@ import {
     ENRICH_MIN_CHARS,
     buildEnrichKeywordsSummary,
     buildEnrichMessages,
+    buildEnrichShortfallInstruction,
     canEnrichChapter,
     checkSensitive,
     detectNoEnrichOutput,
@@ -348,6 +349,10 @@ const DEFAULT_SETTINGS = {
     apiTimeoutMin: 15,  // 每段 API 请求超时时间
     apiRateLimit: 3,    // 每分钟最多请求次数
     apiConcurrency: 1,  // 清洗、阶段概括和角色 AI 人设共用的最大并发请求数；0按串行兼容
+    judgeConcurrency: 1, // 判定（AI/批量）并发请求数；判定与清洗/加料互不影响
+    judgeRateLimit: 0,   // 判定每分钟限速，0=不限（仅受并发数约束）
+    enrichConcurrency: 1, // AI 加料并发请求数；加料与清洗/判定互不影响
+    enrichRateLimit: 0,   // 加料每分钟限速，0=不限
     cleanAutoResume: false, // 一轮清洗后仍有未完成分段时自动续跑，直到全部完成；完成后弹窗提醒
     vecRateLimit: 3,    // 向量化每分钟最多请求次数
     vecConcurrency: 1,  // 1=串行；>1=最大并发请求数；0按串行兼容
@@ -408,7 +413,7 @@ const DEFAULT_SETTINGS = {
     // AI 加料（P3）
     enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
     enrichTemplates: DEFAULT_ENRICH_TEMPLATES,  // 模板库（读取走 niEnrichTemplates 克隆）
-    enrichParams: { intensity: 'medium', maxTokens: 4000, maxTokensAuto: true },
+    enrichParams: { intensity: 'medium', maxTokens: 4000, maxTokensAuto: true, minChars: ENRICH_MIN_CHARS, enforceMinChars: true },
     enrichSafety: { enabled: true, sensitiveWords: [] },
 };
 
@@ -1393,6 +1398,22 @@ function niBindGlobalActions() {
         'ni-e-report-close': () => { const el = document.getElementById('ni-e-report-modal'); if (el) el.style.display = 'none'; },
         'ni-e-report-restore': () => niEnrichRestoreFiltered(),
         'ni-vec-debug-close': () => { const el = document.getElementById('ni-vec-debug-modal'); if (el) el.style.display = 'none'; },
+        // 判定工具栏（原 $app 委托在安卓 WebView 不可靠，统一走全局分发）
+        'ni-btn-judge': () => { void niJudgeStartQueue(); },
+        'ni-btn-judge-pause': () => niJudgeActiveQueue()?.pause(),
+        'ni-btn-judge-skip': () => niJudgeActiveQueue()?.skipCurrent(),
+        'ni-btn-judge-cancel': () => niJudgeActiveQueue()?.cancelAll(),
+        'ni-btn-judge-retry': () => niJudgeRejudgeFailed(),
+        'ni-btn-judge-reall': () => niJudgeRejudgeAll(),
+        'ni-btn-judge-scan': () => niJudgeKeywordScan(),
+        'ni-btn-judge-refine': () => niJudgeAiRefine(),
+        'ni-btn-judge-csv': () => niJudgeExportCsv(),
+        // 加料工具栏
+        'ni-btn-enrich': () => { void niEnrichStartQueue(); },
+        'ni-btn-enrich-pause': () => niEnrichQueue?.pause(),
+        'ni-btn-enrich-skip': () => niEnrichQueue?.skipCurrent(),
+        'ni-btn-enrich-cancel': () => niEnrichQueue?.cancelAll(),
+        'ni-btn-enrich-retry': () => niEnrichQueue?.run(),
     };
 
     document.addEventListener('click', (e) => {
@@ -1520,6 +1541,14 @@ window.niToggleStagePrompt = niToggleStagePrompt;
 // ============================================================
 const ApiSemaphore = new DynamicSemaphore(() =>
     concurrencyLimit(extension_settings[EXT_NAME]?.apiConcurrency, DEFAULT_SETTINGS.apiConcurrency)
+);
+
+// 判定/加料各自独立的并发信号量（与清洗互不影响；容量动态读取设置，改后即时生效）
+const JudgeSemaphore = new DynamicSemaphore(() =>
+    Math.max(1, parseInt(extension_settings[EXT_NAME]?.judgeConcurrency, 10) || DEFAULT_SETTINGS.judgeConcurrency)
+);
+const EnrichSemaphore = new DynamicSemaphore(() =>
+    Math.max(1, parseInt(extension_settings[EXT_NAME]?.enrichConcurrency, 10) || DEFAULT_SETTINGS.enrichConcurrency)
 );
 
 const VecSemaphore = new DynamicSemaphore(() =>
@@ -3176,6 +3205,16 @@ const _apiQueue = new PersistedRateQueue({
     getLimit: () => extension_settings[EXT_NAME]?.apiRateLimit,
 });
 
+// 判定/加料独立的限速队列（与清洗限速互不影响；limit<=0 表示不限速）
+const _judgeQueue = new PersistedRateQueue({
+    storageKey: `${EXT_NAME}:judge-last-request-at`,
+    getLimit: () => extension_settings[EXT_NAME]?.judgeRateLimit,
+});
+const _enrichQueue = new PersistedRateQueue({
+    storageKey: `${EXT_NAME}:enrich-last-request-at`,
+    getLimit: () => extension_settings[EXT_NAME]?.enrichRateLimit,
+});
+
 // 向量化 API 限速队列
 const _vecQueue = new PersistedRateQueue({
     storageKey: `${EXT_NAME}:vec-last-request-at`,
@@ -3185,10 +3224,10 @@ const _vecQueue = new PersistedRateQueue({
 // ============================================================
 // 自动生成阶段标题和概括
 // ============================================================
-// 角色/阶段概括与清洗共用每分钟限速；实际并发由 apiConcurrency 和 ApiSemaphore 共同限制
-async function niAcquireApiRateSlot(signal = null) {
+// 限速队列获取（支持中止）：清洗/判定/加料各用各的队列，互不阻塞
+async function niAcquireFromQueue(queue, signal = null) {
     if (!signal) {
-        await _apiQueue.acquire();
+        await queue.acquire();
         return;
     }
     if (signal.aborted) throw new Error('请求已中止（超时或用户操作）');
@@ -3198,11 +3237,26 @@ async function niAcquireApiRateSlot(signal = null) {
         signal.addEventListener('abort', onAbort, { once: true });
     });
     try {
-        await Promise.race([_apiQueue.acquire(), abortPromise]);
+        await Promise.race([queue.acquire(), abortPromise]);
     } finally {
         if (onAbort) signal.removeEventListener('abort', onAbort);
     }
     if (signal.aborted) throw new Error('请求已中止（超时或用户操作）');
+}
+
+// 角色/阶段概括与清洗共用每分钟限速；实际并发由 apiConcurrency 和 ApiSemaphore 共同限制
+async function niAcquireApiRateSlot(signal = null) {
+    return niAcquireFromQueue(_apiQueue, signal);
+}
+
+// 判定（AI 精判/批量扫描）独立限速；并发由 judgeConcurrency 和 JudgeSemaphore 限制
+async function niAcquireJudgeRateSlot(signal = null) {
+    return niAcquireFromQueue(_judgeQueue, signal);
+}
+
+// AI 加料独立限速；并发由 enrichConcurrency 和 EnrichSemaphore 限制
+async function niAcquireEnrichRateSlot(signal = null) {
+    return niAcquireFromQueue(_enrichQueue, signal);
 }
 
 // 手动触发：角色概括
@@ -3928,9 +3982,10 @@ let _niEnrichDetailId = null;
 function niEnrichStateText(ch) {
     if (ch?.enrich?.noContent) return '无加料（AI 判定原文无可加料内容，已保留原文）';
     if (!ch?.enrich) return '未加料';
+    const minChars = Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS);
     const base = ch.enrich.reviewed === false ? '需人工审核' : `已生成（${enrichIntensityLabel(ch.enrich.intensity)}）`;
     const lenPart = typeof ch.enrich.charCount === 'number' ? ` · ${ch.enrich.charCount} 字` : '';
-    const shortPart = ch.enrich.short ? ` · 不足 ${ENRICH_MIN_CHARS} 字` : '';
+    const shortPart = ch.enrich.short ? ` · 不足最低 ${minChars} 字` : '';
     const segPart = Array.isArray(ch.enrich.segments) && ch.enrich.segments.length ? ` · 已回填 ${ch.enrich.segments.length} 段` : '';
     const mergePart = ch.enrich.merge === 'ok' ? ''
         : ch.enrich.merge === 'partial' ? ' · 部分段落需人工调整'
@@ -3965,7 +4020,8 @@ async function niEnrichDetailGenerate(btn) {
             },
         });
         if (result?.noContent) toastr?.info('本章无可加料内容，已跳过（保留原文）');
-        else if (result?.short) toastr?.warning(`加料完成，但仅 ${result.charCount} 字（要求 ≥${ENRICH_MIN_CHARS} 字），建议重新生成`);
+        else if (result?.underMin) toastr?.warning(`加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按强制字数要求标记失败；可点「重试失败」重新生成或在详情中手动补写`);
+        else if (result?.short) toastr?.warning(`加料完成，但仅 ${result.charCount} 字（要求 ≥${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字），建议重新生成`);
         else toastr?.success(result.reviewed ? '加料完成' : '加料完成，但内容含敏感词，请人工审核');
     } catch (err) {
         if (err?.message !== 'AbortError') toastr?.error(`加料失败：${err?.message || err}`);
@@ -4458,9 +4514,9 @@ function niEnrichOnKeyDown(e) {
 // 判定 API 客户端（独立档位，走酒馆反代）
 const { callProfileApi: niJudgeCall } = createProfileApiClient({
     getProfile: () => niJudgeApiCfg(),
-    acquireRateSlot: niAcquireApiRateSlot,
+    acquireRateSlot: niAcquireJudgeRateSlot,
     runWithSemaphore,
-    semaphore: ApiSemaphore,
+    semaphore: JudgeSemaphore,
     readChatCompletionStream: niReadChatCompletionStream,
     hasLengthFinishReason: niHasLengthFinishReason,
     extractChatCompletionText: niExtractChatCompletionText,
@@ -4493,7 +4549,11 @@ function niJudgeSaveRules(patch) {
 function niJudgeApiCfg() {
     const base = { ...DEFAULT_SETTINGS.judgeApi };
     const saved = extension_settings[EXT_NAME]?.judgeApi;
-    return saved && typeof saved === 'object' ? { ...base, ...saved } : base;
+    const cfg = saved && typeof saved === 'object' ? { ...base, ...saved } : base;
+    // 判定 API 语义 = 独立配置（自带 url/key/model，无「预设/独立」双勾选 UI）：
+    // 显式补 useIndependentApi，否则 callProfileApi 会把判定请求当成「两个 API 来源都没选」而拒绝。
+    cfg.useIndependentApi = saved?.useIndependentApi ?? true;
+    return cfg;
 }
 
 function niJudgeSaveApi(patch) {
@@ -4616,69 +4676,101 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
  * 批量场景扫描（一次 AI 调用判定一组章节，默认 10 章/组）：
  * 本地场景引擎先为每章提取场景窗口原文 → 打包成材料 → AI 逐章标记 has_gap →
  * 写回每章 judge（本地安全否决优先；AI 遗漏章节回退本地初筛结论）。
+ * AI 调用/解析失败时整组降级为本地场景引擎初筛（不会全部失败），失败原因写入每章 error 供详情查看。
  * 标记「是/存疑」的章节后续单独走原 AI 加料流程。
  */
 async function judgeChapterBatch(group, { signal = null } = {}) {
     const list = (Array.isArray(group) ? group : [group]).filter(ch => ch && ch.text);
     if (!list.length) return;
-    const rules = niJudgeRules();
-    const api = niJudgeApiCfg();
-    if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
-    const sceneCfg = niSceneConfig();
-    const bookProfile = niGetBookProfile().profile;
-    const autoNames = niGetAutoNames();
-    const aiThreshold = Number(rules.aiThreshold) || 0.6;
+    let scoredByIndex = new Map();
+    let fallbackMsg = '';
+    try {
+        const rules = niJudgeRules();
+        const api = niJudgeApiCfg();
+        if (!api.url || !api.model) throw new Error('请先在「判定设置」中填写 AI 模式需要的接口地址与模型');
+        const sceneCfg = niSceneConfig();
+        const bookProfile = niGetBookProfile().profile;
+        const autoNames = niGetAutoNames();
+        const aiThreshold = Number(rules.aiThreshold) || 0.6;
 
-    // 本地场景引擎初筛（窗口明细/安全否决；AI 遗漏章节时回退）
-    const local = new Map();
-    for (const ch of list) local.set(ch.index, niScoreChapter(ch));
+        // 本地场景引擎初筛（窗口明细/安全否决；AI 遗漏或降级时回退）
+        for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
 
-    const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
-    const chaptersText = buildBatchChaptersText(list, {
-        sceneConfig: sceneCfg,
-        bookProfile,
-        autoNames,
-        maxCharsPerChapter: Number(sceneCfg.batch_max_chars_per_chapter) || 1200,
-    });
-    const messages = buildBatchJudgeMessages(template, {
-        chaptersText,
-        rulesSummary: buildJudgeRulesSummary(rules),
-    });
-    const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 2000 });
-    const byIndex = parseBatchJudgeResponse(raw);
+        const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
+        const chaptersText = buildBatchChaptersText(list, {
+            sceneConfig: sceneCfg,
+            bookProfile,
+            autoNames,
+            maxCharsPerChapter: Number(sceneCfg.batch_max_chars_per_chapter) || 1200,
+        });
+        const messages = buildBatchJudgeMessages(template, {
+            chaptersText,
+            rulesSummary: buildJudgeRulesSummary(rules),
+        });
+        const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 2000 });
+        const byIndex = parseBatchJudgeResponse(raw);
 
-    for (const ch of list) {
-        const scored = local.get(ch.index) || niScoreChapter(ch);
-        // 本地安全否决优先（词表直接命中，比 AI 可靠）
-        if (scored.vetoed) {
-            ch.judge = { ...keywordJudgeToStore(scored), result: 'vetoed', hybridPending: false, at: Date.now() };
-        } else {
-            const res = byIndex.get(ch.index);
-            if (!res) {
-                // AI 遗漏该章：回退本地初筛结论
-                const cls = classifyKeywordResult(scored);
-                ch.judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
+        for (const ch of list) {
+            const scored = scoredByIndex.get(ch.index) || niScoreChapter(ch);
+            // 本地安全否决优先（词表直接命中，比 AI 可靠）
+            if (scored.vetoed) {
+                ch.judge = { ...keywordJudgeToStore(scored), result: 'vetoed', hybridPending: false, at: Date.now() };
             } else {
-                const isDoubt = res.confidence < aiThreshold;
+                const res = byIndex.get(ch.index);
+                if (!res) {
+                    // AI 遗漏该章：回退本地初筛结论
+                    const cls = classifyKeywordResult(scored);
+                    ch.judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
+                } else {
+                    const isDoubt = res.confidence < aiThreshold;
+                    ch.judge = {
+                        result: isDoubt ? 'doubt' : res.result,
+                        confidence: res.confidence,
+                        evidence: res.evidence || scored.evidence,
+                        mode: 'batch',
+                        scenes: scored.scenes,
+                        safety: scored.safety,
+                        bookProfile: scored.bookProfile,
+                        modes: scored.modes,
+                        score: scored.score,
+                        hitCount: scored.hitCount,
+                        at: Date.now(),
+                    };
+                }
+            }
+            delete ch.error;
+            transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+        }
+        niEnrichScheduleSave();
+    } catch (err) {
+        if (signal?.aborted || err?.message === 'AbortError') throw err;
+        // 降级：整组回退本地场景引擎初筛，AI 失败原因写入每章 error（详情弹窗可查）
+        const hint = /context|token|length|400|maximum|too large/i.test(String(err?.message || ''))
+            ? '（可能是输入/输出超出模型上限：请调小每批章数或「每章材料上限」，或换上下文更大的模型）'
+            : '';
+        fallbackMsg = `批量 AI 判定失败，已回退本地场景引擎初筛：${err?.message || err}${hint}`;
+        console.warn('[NI] 批量场景扫描降级为本地初筛:', err?.message || err);
+        for (const ch of list) {
+            let scored = scoredByIndex.get(ch.index);
+            try { scored = scored || niScoreChapter(ch); } catch (_) { scored = null; }
+            if (scored) {
+                const cls = classifyKeywordResult(scored);
                 ch.judge = {
-                    result: isDoubt ? 'doubt' : res.result,
-                    confidence: res.confidence,
-                    evidence: res.evidence || scored.evidence,
-                    mode: 'batch',
-                    scenes: scored.scenes,
-                    safety: scored.safety,
-                    bookProfile: scored.bookProfile,
-                    modes: scored.modes,
-                    score: scored.score,
-                    hitCount: scored.hitCount,
+                    ...keywordJudgeToStore(scored),
+                    result: scored.vetoed ? 'vetoed' : cls.result,
+                    hybridPending: false,
+                    fallbackReason: fallbackMsg,
                     at: Date.now(),
                 };
+                ch.error = fallbackMsg;
+                transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+            } else {
+                ch.error = err?.message || String(err);
+                transitionChapter(ch, CHAPTER_STATUS.FAILED);
             }
         }
-        delete ch.error;
-        transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+        niEnrichScheduleSave();
     }
-    niEnrichScheduleSave();
 }
 
 /**
@@ -4767,6 +4859,11 @@ function niForEachGroupItem(item, fn) {
     (Array.isArray(item) ? item : [item]).forEach(fn);
 }
 
+/** 判定并发数（逐章与批量共用；0/空按 1 串行）。 */
+function niJudgeConcurrency() {
+    return Math.max(1, parseInt(extension_settings[EXT_NAME]?.judgeConcurrency, 10) || 1);
+}
+
 /** 判定队列按当前模式分发：batch → 分组批量队列；其余 → 逐章队列。 */
 function niJudgeEnsureQueue() {
     const isBatch = niJudgeRules().mode === 'batch';
@@ -4779,9 +4876,15 @@ function niJudgeEnsureQueue() {
             processItem: judgeChapterBatch,
             setProcessingStatus: item => niForEachGroupItem(item, ch => { if (ch) ch.status = CHAPTER_STATUS.DETECTING; }),
             setSkippedStatus: item => niForEachGroupItem(item, ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } }),
-            setFailedStatus: item => niForEachGroupItem(item, ch => { if (ch && ch.status !== CHAPTER_STATUS.JUDGED) { ch.status = CHAPTER_STATUS.FAILED; niEnrichScheduleSave(); } }),
+            setFailedStatus: (item, index, err) => niForEachGroupItem(item, ch => {
+                if (ch && ch.status !== CHAPTER_STATUS.JUDGED) {
+                    ch.status = CHAPTER_STATUS.FAILED;
+                    if (!ch.error) ch.error = err?.message || '批量判定失败';
+                    niEnrichScheduleSave();
+                }
+            }),
             resetStatus: item => niForEachGroupItem(item, ch => { if (ch) { ch.status = CHAPTER_STATUS.UNDETECTED; niEnrichScheduleSave(); } }),
-            concurrency: () => 1,
+            concurrency: niJudgeConcurrency,
             onProgress: niJudgeOnProgress,
             persist: () => niEnrichScheduleSave({ immediate: true }),
         })
@@ -4793,7 +4896,7 @@ function niJudgeEnsureQueue() {
             setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
             setFailedStatus: ch => { if (ch && ch.status !== CHAPTER_STATUS.JUDGED) { ch.status = CHAPTER_STATUS.FAILED; niEnrichScheduleSave(); } },
             resetStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.UNDETECTED; niEnrichScheduleSave(); } },
-            concurrency: () => 1,
+            concurrency: niJudgeConcurrency,
             onProgress: niJudgeOnProgress,
             persist: () => niEnrichScheduleSave({ immediate: true }),
         });
@@ -4805,6 +4908,13 @@ function niJudgeEnsureQueue() {
 function niJudgeActiveQueue() {
     if (niJudgeRules().mode === 'batch') return niJudgeQueue || niJudgeEnsureQueue();
     return niJudgeQueue || niJudgeEnsureQueue();
+}
+
+/** 开始判定（工具栏/全局动作）：运行中或队列为空时给出明确提示。 */
+async function niJudgeStartQueue() {
+    if (niJudgeQueue?.isRunning?.()) { toastr?.warning('判定队列运行中，请先暂停或等待完成'); return; }
+    const ok = await niJudgeEnsureQueue()?.run();
+    if (ok === false) toastr?.info('没有待判定的章节（或当前引擎组合下没有符合条件的章节）');
 }
 
 function niJudgeOnProgress(p) {
@@ -5023,6 +5133,8 @@ function niJudgeSyncSettingsUI() {
     if (streamEl) streamEl.checked = !!api.stream;
     sv('#ni-j-api-timeout', api.timeoutSec ?? 60);
     sv('#ni-j-api-retries', api.retries ?? 2);
+    sv('#ni-j-concurrency', extension_settings[EXT_NAME]?.judgeConcurrency ?? DEFAULT_SETTINGS.judgeConcurrency);
+    sv('#ni-j-rate-limit', extension_settings[EXT_NAME]?.judgeRateLimit ?? DEFAULT_SETTINGS.judgeRateLimit);
     const ptEl = q('#ni-j-prompt');
     if (ptEl) ptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.template || DEFAULT_JUDGE_PROMPT;
     // 批量场景扫描：每批章数 + 批量模板
@@ -5079,9 +5191,9 @@ function niJudgeExportCsv() {    const chapters = Array.isArray(S.enrichChapters
 // 加料 API 客户端（独立档位；流式支持 onDelta 增量回调；可选跟随酒馆主预设服务配置）
 const { callProfileApi: niEnrichCall } = createProfileApiClient({
     getProfile: () => niEnrichApiCfg(),
-    acquireRateSlot: niAcquireApiRateSlot,
+    acquireRateSlot: niAcquireEnrichRateSlot,
     runWithSemaphore,
-    semaphore: ApiSemaphore,
+    semaphore: EnrichSemaphore,
     readChatCompletionStream: niReadChatCompletionStream,
     hasLengthFinishReason: niHasLengthFinishReason,
     extractChatCompletionText: niExtractChatCompletionText,
@@ -5231,6 +5343,8 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         }
         const templates = niEnrichTemplates();
         const params = niEnrichParams();
+        const minChars = Math.max(0, Number(params.minChars) || ENRICH_MIN_CHARS);
+        const enforceMin = params.enforceMinChars !== false && minChars > 0;
         const preferredId = ch.enrich?.templateId || params.templateId || templates[0]?.id;
         const template = templates.find(t => t.id === preferredId) || templates[0];
         if (!template?.prompt) throw new Error('没有可用的加料模板，请先在「加料设置」中新建或恢复默认模板');
@@ -5239,6 +5353,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             keywords: buildEnrichKeywordsSummary(ch.judge),
             style: template.style || template.name || '',
             intensity: `${enrichIntensityLabel(params.intensity)}\n${enrichIntensityGuide(params.intensity)}`,
+            minChars,
         });
         // 预设模式：把酒馆当前预设（如「泉此方改加料」）启用的提示词拼进请求，
         // 复用项目「跟随酒馆预设」机制（createTavernPresetMessageTools）：
@@ -5308,13 +5423,44 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             // AI 没按格式输出（无段落编号）：整段视为一条无锚点加料，走兜底插入
             segments = [{ paragraph: 0, content: cleaned }];
         }
+        // —— 强制字数：不足最低要求时自动追加一轮扩写（仅一次）——
+        let addedLen = segments.reduce((sum, seg) => sum + String(seg.content || '').length, 0);
+        if (enforceMin && addedLen > 0 && addedLen < minChars) {
+            const boostMessages = [...messages, { role: 'user', content: buildEnrichShortfallInstruction(addedLen, minChars) }];
+            let raw2 = '';
+            let lastErr2 = null;
+            for (let attempt = 0; attempt <= retries; attempt++) {
+                if (signal?.aborted) throw new Error('AbortError');
+                try {
+                    raw2 = await niEnrichCall(boostMessages, { responseLength: maxTokens, signal, onDelta });
+                    break;
+                } catch (err) {
+                    if (signal?.aborted || err?.message === 'AbortError') throw err;
+                    lastErr2 = err;
+                    if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+                }
+            }
+            if (raw2) {
+                niEnrichConsumeQuota();
+                const cleaned2 = niFilterEnrichOutput(raw2);
+                if (!detectNoEnrichOutput(cleaned2)) {
+                    const segs2 = niParseEnrichSegments(cleaned2);
+                    if (segs2.length) {
+                        segments.push(...segs2);
+                        console.log(`[NI] 加料字数不足已自动扩写一轮：${addedLen} → ${segments.reduce((s, seg) => s + String(seg.content || '').length, 0)} 字`);
+                    }
+                }
+            } else {
+                console.warn('[NI] 加料字数补足扩写失败:', lastErr2?.message || lastErr2);
+            }
+            addedLen = segments.reduce((sum, seg) => sum + String(seg.content || '').length, 0);
+        }
         const seamKeywords = (ch.judge?.evidence || '')
             .split(/[，,、;；\s]+/).map(s => s.trim()).filter(s => s.length >= 2);
         const mergeResult = mergeEnrichSegments(ch.text, segments, { seamKeywords });
         const mergedText = mergeResult.text;
         const reviewed = !(safety.enabled && checkSensitive(mergedText, safety.sensitiveWords));
         const postHit = safety.enabled ? checkSensitive(mergedText, safety.sensitiveWords) : null;
-        const addedLen = segments.reduce((sum, seg) => sum + String(seg.content || '').length, 0);
         ch.enrich = {
             text: mergedText,          // 加料版全文（原文 + 加料段落回填）
             segments,                  // 回填段落清单（含段落号），供详情弹窗人工调整
@@ -5324,15 +5470,22 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             at: Date.now(),
             reviewed,
             charCount: addedLen,       // 加料内容字数（非合并后总字数）
-            short: addedLen < ENRICH_MIN_CHARS,
+            short: addedLen < minChars,
         };
+        // —— 强制字数：扩写一轮后仍不足 → 标记失败（保留内容供查看，可重试重新生成）——
+        if (enforceMin && addedLen < minChars) {
+            ch.error = `加料字数不足 ${minChars} 字（实际 ${addedLen} 字），已保留生成内容；可点「重试失败」重新生成或在详情中手动补写`;
+            transitionChapter(ch, CHAPTER_STATUS.FAILED);
+            niEnrichScheduleSave();
+            return { reviewed, text: mergedText, charCount: addedLen, short: true, underMin: true, merge: mergeResult.status };
+        }
         delete ch.error;
         if (!reviewed) {
             ch.error = `生成内容含敏感词「${postHit.word}」，已保留待人工审核`;
         }
         transitionChapter(ch, CHAPTER_STATUS.ENRICHED);
         niEnrichScheduleSave();
-        return { reviewed, text: mergedText, charCount: addedLen, short: addedLen < ENRICH_MIN_CHARS, merge: mergeResult.status };
+        return { reviewed, text: mergedText, charCount: addedLen, short: addedLen < minChars, merge: mergeResult.status };
     } catch (err) {
         if (signal?.aborted || err?.message === 'AbortError') throw err;
         if (!niEnrichIsPermanentError(err)) {
@@ -5352,7 +5505,8 @@ function niEnrichEnsureQueue() {
     niEnrichQueueCreated = true;
     niEnrichQueue = createBatchQueueController({
         getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
-        isEligible: ch => canEnrichChapter(ch) && !ch.enrich,
+        // 待加料：有资格且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成
+        isEligible: ch => canEnrichChapter(ch) && (!ch.enrich || (ch.status === CHAPTER_STATUS.FAILED && ch.enrich.short === true)),
         processItem: enrichChapter,
         setProcessingStatus: ch => { if (ch) ch.status = CHAPTER_STATUS.ENRICHING; },
         setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
@@ -5363,12 +5517,21 @@ function niEnrichEnsureQueue() {
             }
         },
         resetStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.JUDGED; niEnrichScheduleSave(); } },
-        concurrency: () => 1,
+        concurrency: () => Math.max(1, parseInt(extension_settings[EXT_NAME]?.enrichConcurrency, 10) || 1),
         onProgress: niEnrichOnProgress,
         persist: () => niEnrichScheduleSave({ immediate: true }),
     });
     niSetBatchQueues({ enrich: niEnrichQueue });
     return niEnrichQueue;
+}
+
+/** 开始加料（工具栏/全局动作）：运行中或队列为空时给出明确提示。 */
+async function niEnrichStartQueue() {
+    if (niEnrichQueue?.isRunning?.()) { toastr?.warning('加料队列运行中，请先暂停或等待完成'); return; }
+    const ok = await niEnrichEnsureQueue()?.run();
+    if (ok === false) {
+        toastr?.info('没有可加料的章节：需判定为「是/存疑」且尚未加料，或人工标记「通过」；可先对章节点「重判」或人工标记');
+    }
 }
 
 function niEnrichOnProgress(p) {
@@ -5581,6 +5744,8 @@ function niEnrichSyncSettingsUI() {
     sv('#ni-e-api-topp', api.topP ?? 1);
     sv('#ni-e-api-timeout', api.timeoutSec ?? 120);
     sv('#ni-e-api-retries', api.retries ?? 2);
+    sv('#ni-e-concurrency', extension_settings[EXT_NAME]?.enrichConcurrency ?? DEFAULT_SETTINGS.enrichConcurrency);
+    sv('#ni-e-rate-limit', extension_settings[EXT_NAME]?.enrichRateLimit ?? DEFAULT_SETTINGS.enrichRateLimit);
     sv('#ni-e-api-quota', api.dailyQuota ?? 0);
     const usedEl = q('#ni-e-api-quota-used');
     if (usedEl) usedEl.textContent = String(niEnrichDailyUsed());
@@ -5589,6 +5754,9 @@ function niEnrichSyncSettingsUI() {
     sv('#ni-e-max-tokens', params.maxTokens ?? 4000);
     const maxAutoEl = q('#ni-e-max-auto');
     if (maxAutoEl) maxAutoEl.checked = params.maxTokensAuto !== false;
+    sv('#ni-e-min-chars', params.minChars ?? ENRICH_MIN_CHARS);
+    const enforceMinEl = q('#ni-e-enforce-min');
+    if (enforceMinEl) enforceMinEl.checked = params.enforceMinChars !== false;
     const safetyEl = q('#ni-e-safety-enabled');
     if (safetyEl) safetyEl.checked = safety.enabled !== false;
     const wordsEl = q('#ni-e-safety-words');
@@ -5828,7 +5996,8 @@ jQuery(async () => {
                 niEnrichRenderStats();
                 niEnrichSyncButtons(false);
                 if (result?.noContent) toastr?.info(`「${ch.title}」无可加料内容，已跳过（保留原文）`);
-                else if (result?.short) toastr?.warning(`「${ch.title}」加料完成，但仅 ${result.charCount} 字（要求 ≥${ENRICH_MIN_CHARS} 字），建议重新生成`);
+                else if (result?.underMin) toastr?.warning(`「${ch.title}」加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按强制字数要求标记失败；可重试或手动补写`);
+                else if (result?.short) toastr?.warning(`「${ch.title}」加料完成，但仅 ${result.charCount} 字（要求 ≥${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字），建议重新生成`);
                 else toastr?.success(result.reviewed ? `「${ch.title}」加料完成` : `「${ch.title}」加料完成，内容含敏感词需审核`);
             } catch (err) {
                 if (err?.message !== 'AbortError') toastr?.error(`加料失败：${err?.message || err}`);
@@ -5860,17 +6029,8 @@ jQuery(async () => {
     document.addEventListener('keydown', niEnrichOnKeyDown);
     niEnrichTryRestore();
 
-    // ── 判定卡片 ──
+    // ── 判定卡片（工具栏按钮已由 niBindGlobalActions() 全局分发，见 niBindGlobalActions）──
     $app.on('click', '#ni-j-cfg-btn', () => niTogglePanel('ni-j-settings', 'ni-j-cfg-btn'));
-    $app.on('click', '#ni-btn-judge', () => { niJudgeEnsureQueue()?.run(); });
-    $app.on('click', '#ni-btn-judge-pause', () => niJudgeActiveQueue()?.pause());
-    $app.on('click', '#ni-btn-judge-skip', () => niJudgeActiveQueue()?.skipCurrent());
-    $app.on('click', '#ni-btn-judge-cancel', () => niJudgeActiveQueue()?.cancelAll());
-    $app.on('click', '#ni-btn-judge-retry', () => niJudgeRejudgeFailed());
-    $app.on('click', '#ni-btn-judge-reall', () => niJudgeRejudgeAll());
-    $app.on('click', '#ni-btn-judge-scan', () => niJudgeKeywordScan());
-    $app.on('click', '#ni-btn-judge-refine', () => niJudgeAiRefine());
-    $app.on('click', '#ni-btn-judge-csv', () => niJudgeExportCsv());
 
     // 判定引擎（并列勾选：关键词/AI/批量）
     $app.on('change', '#ni-j-engine-keyword, #ni-j-engine-ai, #ni-j-engine-batch, #ni-j-ai-scope', function () {
@@ -5980,6 +6140,17 @@ jQuery(async () => {
     $app.on('change', '#ni-j-api-stream', function () { niJudgeSaveApi({ stream: this.checked }); });
     $app.on('change', '#ni-j-api-timeout', function () { niJudgeSaveApi({ timeoutSec: Math.max(5, parseInt(this.value, 10) || 60) }); });
     $app.on('change', '#ni-j-api-retries', function () { niJudgeSaveApi({ retries: Math.max(0, Math.min(10, parseInt(this.value, 10) || 0)) }); });
+    $app.on('change', '#ni-j-concurrency', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.judgeConcurrency = Math.max(1, Math.min(16, parseInt(this.value, 10) || 1));
+        saveSettingsDebounced?.();
+        toastr?.info(`判定并发已设为 ${cfg.judgeConcurrency}（下次「开始判定」生效）`);
+    });
+    $app.on('change', '#ni-j-rate-limit', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.judgeRateLimit = Math.max(0, Math.min(600, parseInt(this.value, 10) || 0));
+        saveSettingsDebounced?.();
+    });
     $app.on('change', '#ni-j-prompt', function () {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
         cfg.judgePrompts = { ...(cfg.judgePrompts || {}), template: this.value };
@@ -6031,13 +6202,8 @@ jQuery(async () => {
     niJudgeSyncButtons(false);
     niJudgeEnsureQueue();
 
-    // ── 加料卡片 ──
+    // ── 加料卡片（工具栏按钮已由 niBindGlobalActions() 全局分发）──
     $app.on('click', '#ni-e-cfg-btn', () => niTogglePanel('ni-e-settings', 'ni-e-cfg-btn'));
-    $app.on('click', '#ni-btn-enrich', () => { niEnrichEnsureQueue()?.run(); });
-    $app.on('click', '#ni-btn-enrich-pause', () => niEnrichQueue?.pause());
-    $app.on('click', '#ni-btn-enrich-skip', () => niEnrichQueue?.skipCurrent());
-    $app.on('click', '#ni-btn-enrich-cancel', () => niEnrichQueue?.cancelAll());
-    $app.on('click', '#ni-btn-enrich-retry', () => niEnrichQueue?.run());
 
     // 模板选择与编辑
     $app.on('change', '#ni-e-template-sel', function () {
@@ -6080,6 +6246,10 @@ jQuery(async () => {
         niEnrichSaveParams({ maxTokens: Math.min(8000, Math.max(256, parseInt(this.value, 10) || 4000)) });
     });
     $app.on('change', '#ni-e-max-auto', function () { niEnrichSaveParams({ maxTokensAuto: this.checked }); });
+    $app.on('change', '#ni-e-min-chars', function () {
+        niEnrichSaveParams({ minChars: Math.max(0, parseInt(this.value, 10) || 0) });
+    });
+    $app.on('change', '#ni-e-enforce-min', function () { niEnrichSaveParams({ enforceMinChars: this.checked }); });
 
     // 安全过滤
     $app.on('change', '#ni-e-safety-enabled', function () { niEnrichSaveSafety({ enabled: this.checked }); });
@@ -6118,6 +6288,17 @@ jQuery(async () => {
     $app.on('change', '#ni-e-api-timeout', function () { niEnrichSaveApi({ timeoutSec: Math.max(5, parseInt(this.value, 10) || 120) }); });
     $app.on('change', '#ni-e-api-retries', function () { niEnrichSaveApi({ retries: Math.max(0, Math.min(10, parseInt(this.value, 10) || 0)) }); });
     $app.on('change', '#ni-e-api-quota', function () { niEnrichSaveApi({ dailyQuota: Math.max(0, parseInt(this.value, 10) || 0) }); });
+    $app.on('change', '#ni-e-concurrency', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.enrichConcurrency = Math.max(1, Math.min(8, parseInt(this.value, 10) || 1));
+        saveSettingsDebounced?.();
+        toastr?.info(`加料并发已设为 ${cfg.enrichConcurrency}（下次「开始加料」生效）`);
+    });
+    $app.on('change', '#ni-e-rate-limit', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.enrichRateLimit = Math.max(0, Math.min(600, parseInt(this.value, 10) || 0));
+        saveSettingsDebounced?.();
+    });
     $app.on('click', '#ni-e-api-models', async () => {
         const api = niEnrichApiCfg();
         if (!api.url) { toastr?.warning('请先填写加料 API 地址'); return; }
