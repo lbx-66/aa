@@ -176,9 +176,11 @@ import {
     DEFAULT_JUDGE_RULES,
     LEGACY_BATCH_JUDGE_PROMPT,
     LEGACY_BATCH_JUDGE_PROMPT_V2,
+    LEGACY_BATCH_JUDGE_PROMPT_V3,
     LEGACY_JUDGE_PROMPT,
     LEGACY_JUDGE_PROMPT_V2,
     LEGACY_JUDGE_PROMPT_V3,
+    LEGACY_JUDGE_PROMPT_V4,
     buildBatchChaptersText,
     buildBatchJudgeMessages,
     buildJudgeMessages,
@@ -662,16 +664,18 @@ function niLoadSettings() {
     }
     niUpgradeLegacyTbDefaultPrompts(saved);
     if (niUpgradeRoleplayPrompt(saved)) saveSettingsDebounced();
-    // 判定提示词迁移：历代默认模板（"是否包含亲密描写" / 场景缺口语义 / 性爱情节缺口语义）
-    // → 现行「六类线索+组合判定」模板；仅当模板从未被用户自定义（与旧默认逐字相等）时替换。
+    // 判定提示词迁移：历代默认模板（V1 亲密描写 / V2 场景缺口 / V3 性爱情节缺口 / V4 六类线索）
+    // → 现行「六类线索+破限声明」模板；仅当模板从未被用户自定义（与旧默认逐字相等）时替换。
     if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3) {
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4) {
         saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
     if (saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2) {
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3) {
         saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
@@ -4626,6 +4630,19 @@ function niScoreChapter(ch) {
     });
 }
 
+/** 识别「模型内容安全拦截」错误（Google Gemini 等对含敏感词的提示词直接 400 拒绝）。 */
+function niIsSensitivePromptError(err) {
+    const msg = String(err?.message || err || '');
+    return /sensitive words|prohibited use policy|rephrasing the prompt|content.{0,10}(filter|safety|policy)|blocked.{0,10}prompt|unsafe.{0,10}prompt|prompt.{0,10}(blocked|filtered|unsafe)/i.test(msg);
+}
+
+/** 模型内容安全拦截的友好提示（换模型/改模板指引）。 */
+function niSensitivePromptHint(msg) {
+    const base = String(msg || '');
+    if (!niIsSensitivePromptError(base)) return base;
+    return `${base}\n【提示】当前模型拒绝了包含敏感词的判定提示词（Google Gemini 等模型的内容安全策略）。建议：1) 在「判定设置」换用其他模型（OpenAI 系/本地模型等）；2) 或修改判定/批量提示词模板，去掉露骨的词例（如口交/射精/强奸/轮奸等，改用委婉表述）；3) 或改用「仅关键词判定」模式（不经过 AI）。`;
+}
+
 /** 判定 API 调用（含截断放大重试）；供逐章 AI 判定与批量场景扫描共用。 */
 async function niJudgeCallRetry(messages, api, signal, { baseLength = 800 } = {}) {
     const retries = Math.max(0, Number(api.retries) || 0);
@@ -4821,7 +4838,7 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
     } catch (err) {
         if (signal?.aborted || err?.message === 'AbortError') throw err;
         // 已有可疑标记时保留标记（AI 精判失败可再次重试），仅记录错误
-        if (!ch.judge?.hybridPending) ch.error = err?.message || String(err);
+        if (!ch.judge?.hybridPending) ch.error = niSensitivePromptHint(err?.message || String(err));
         transitionChapter(ch, CHAPTER_STATUS.FAILED);
         niEnrichScheduleSave();
         throw err;
@@ -4875,7 +4892,7 @@ function niJudgeEnsureQueue() {
             setFailedStatus: (item, index, err) => niForEachGroupItem(item, ch => {
                 if (ch && ch.status !== CHAPTER_STATUS.JUDGED) {
                     ch.status = CHAPTER_STATUS.FAILED;
-                    if (!ch.error) ch.error = err?.message || '批量判定失败';
+                    if (!ch.error) ch.error = niSensitivePromptHint(err?.message || '批量判定失败');
                     niEnrichScheduleSave();
                 }
             }),
@@ -5485,7 +5502,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
     } catch (err) {
         if (signal?.aborted || err?.message === 'AbortError') throw err;
         if (!niEnrichIsPermanentError(err)) {
-            ch.error = err?.message || String(err);
+            ch.error = niSensitivePromptHint(err?.message || String(err));
             transitionChapter(ch, CHAPTER_STATUS.FAILED);
         } else {
             ch.status = prevStatus;
@@ -5509,6 +5526,7 @@ function niEnrichEnsureQueue() {
         setFailedStatus: ch => {
             if (ch && ch.status !== CHAPTER_STATUS.ENRICHED && !niEnrichIsPermanentError(ch.error)) {
                 ch.status = CHAPTER_STATUS.FAILED;
+                if (ch.error) ch.error = niSensitivePromptHint(ch.error);
                 niEnrichScheduleSave();
             }
         },
