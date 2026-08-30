@@ -1554,9 +1554,9 @@
             <textarea id="ni-e-safety-words" class="ni-j-prompt-textarea" rows="3" placeholder="每行一个敏感词" spellcheck="false"></textarea>
           </div>
           <div class="ni-j-cfg-group">
-            <div class="ni-ctitle-label">加料 API 来源</div>
-            <label class="ni-j-cfg-lbl"><input type="radio" name="ni-e-api-mode" id="ni-e-api-mode-ind" value="ind" checked> 独立 API 配置（下方填写地址/Key/模型）</label>
-            <label class="ni-j-cfg-lbl"><input type="radio" name="ni-e-api-mode" id="ni-e-api-mode-tavern" value="tavern"> 使用酒馆主预设（API 连接/模型与预设提示词都跟随酒馆当前设置）</label>
+            <div class="ni-ctitle-label">加料 API 来源（预设与 API 是两层，可同时勾选或同时取消）</div>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-api-tavern"> 使用酒馆主预设（加料拼入酒馆当前预设的提示词，模型跟随酒馆当前激活模型；Custom 源需在酒馆连接里填了「自定义 API 地址」）</label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-api-ind" checked> 独立 API 配置（下方填写地址/Key/模型；与预设同时勾选时使用独立连接 + 预设提示词）</label>
             <div id="ni-e-api-ind-box">
               <div class="ni-tool-row">
                 <button class="ni-e-btn" id="ni-e-api-copy-judge" title="将判定 API 的地址/Key/模型复制到加料">一键复制判定配置</button>
@@ -1570,7 +1570,7 @@
                 <button class="ni-e-btn" id="ni-e-api-test">测试连接</button>
               </div>
             </div>
-            <div class="ni-desc" id="ni-e-api-tavern-box" style="display:none;margin:4px 0 0">跟随酒馆主预设：加料将使用酒馆当前激活的 API 连接/模型，并把当前预设（如「泉此方改加料」）的启用提示词拼进加料请求（文风随预设）；Custom 源需在酒馆连接里填了「自定义 API 地址」。</div>
+            <div class="ni-desc" id="ni-e-api-tavern-box" style="display:none;margin:4px 0 0">跟随酒馆主预设：加料请求会拼入酒馆当前预设（如「泉此方改加料」）的启用提示词（文风随预设），模型跟随酒馆当前激活模型。未勾选「独立 API 配置」时，连接也使用酒馆的 API 连接。</div>
             <label class="ni-j-cfg-lbl">流式输出 <input type="checkbox" id="ni-e-api-stream" checked></label>
             <label class="ni-j-cfg-lbl">温度 <input type="number" id="ni-e-api-temp" value="0.9" min="0" max="2" step="0.1" style="width:64px"></label>
             <label class="ni-j-cfg-lbl">top_p <input type="number" id="ni-e-api-topp" value="1" min="0" max="1" step="0.05" style="width:64px"></label>
