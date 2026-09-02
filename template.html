@@ -1444,6 +1444,7 @@
             <label class="ni-j-cfg-lbl">判定阈值（仅参与置信度换算；是/否/存疑/安全否决由场景窗口决策决定）
               <input type="number" id="ni-j-threshold" value="2" min="1" style="width:60px">
             </label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-safety-veto" checked> 安全否决（未成年/非自愿/多人男/排除名单命中 → 判「安全否决」不可加料；关闭后不做词法否决，请自行把握内容尺度）</label>
           </div>
           <div class="ni-j-cfg-group" id="ni-j-ai-group" style="display:none">
             <label class="ni-j-cfg-lbl">AI 存疑阈值（confidence 低于此值标记为「存疑」）

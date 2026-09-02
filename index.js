@@ -177,10 +177,12 @@ import {
     LEGACY_BATCH_JUDGE_PROMPT,
     LEGACY_BATCH_JUDGE_PROMPT_V2,
     LEGACY_BATCH_JUDGE_PROMPT_V3,
+    LEGACY_BATCH_JUDGE_PROMPT_V4,
     LEGACY_JUDGE_PROMPT,
     LEGACY_JUDGE_PROMPT_V2,
     LEGACY_JUDGE_PROMPT_V3,
     LEGACY_JUDGE_PROMPT_V4,
+    LEGACY_JUDGE_PROMPT_V5,
     buildBatchChaptersText,
     buildBatchJudgeMessages,
     buildJudgeMessages,
@@ -205,6 +207,7 @@ import {
 import {
     DEFAULT_ENRICH_TEMPLATES,
     ENRICH_MIN_CHARS,
+    buildEnrichContextNotes,
     buildEnrichKeywordsSummary,
     buildEnrichMessages,
     buildEnrichShortfallInstruction,
@@ -664,18 +667,21 @@ function niLoadSettings() {
     }
     niUpgradeLegacyTbDefaultPrompts(saved);
     if (niUpgradeRoleplayPrompt(saved)) saveSettingsDebounced();
-    // 判定提示词迁移：历代默认模板（V1 亲密描写 / V2 场景缺口 / V3 性爱情节缺口 / V4 六类线索）
-    // → 现行「六类线索+破限声明」模板；仅当模板从未被用户自定义（与旧默认逐字相等）时替换。
+    // 判定提示词迁移：历代默认模板（V1 亲密描写 / V2 场景缺口 / V3 性爱情节缺口 /
+    // V4 六类线索 / V5 破限六类）→ 现行「定制语义（完整场景也有缺口、无安全排除）」模板；
+    // 仅当模板从未被用户自定义（与旧默认逐字相等）时替换。
     if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4) {
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V5) {
         saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
     if (saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3) {
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V4) {
         saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
@@ -4630,6 +4636,14 @@ function niScoreChapter(ch) {
     });
 }
 
+/** 本章情报（人物卡 + 前史卡，来自清洗管道角色表/主线节点；无数据返回 ''）。 */
+function niChapterContextNotes(ch) {
+    return buildEnrichContextNotes(ch?.text || '', {
+        characters: Array.isArray(S.characters) ? S.characters : [],
+        plotNodes: Array.isArray(S.plots?.main) ? S.plots.main : [],
+    });
+}
+
 /** 识别「模型内容安全拦截」错误（Google Gemini 等对含敏感词的提示词直接 400 拒绝）。 */
 function niIsSensitivePromptError(err) {
     const msg = String(err?.message || err || '');
@@ -4683,6 +4697,11 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
     if (scenes.length) {
         rulesSummary += `\n【关键词初筛的场景窗口分析（仅供参考，可核实或反驳）】\n${buildScenesText(scenes)}\n注意：初筛窗口只表示该区域命中了场景词，可能包含误报（如普通亲吻/拥抱/暧昧氛围、比喻用语、农田/战场等字面义隐喻词）。请按上方判定标准独立判断：只有确认为性爱情节且存在缺口才算「是」，普通亲密/纯爱互动一律「无缺口」。`;
     }
+    // 本章情报（人物卡/前史卡）：让 AI 判定时掌握人物关系与剧情前史（如夫妻/恋人/敌对状态）
+    const judgeNotes = niChapterContextNotes(ch);
+    if (judgeNotes) {
+        rulesSummary += `\n【本章人物与前史情报】\n${judgeNotes}`;
+    }
     const messages = buildJudgeMessages(template, {
         chapterContent: ch.text,
         rulesSummary,
@@ -4723,7 +4742,9 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
     for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
 
     const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
-    const chaptersText = buildBatchChaptersText(list, {
+    // 批量材料每章附带本章情报（人物卡/前史卡），AI 判定时掌握人物关系
+    const listWithNotes = list.map(ch => ({ ...ch, contextNotes: niChapterContextNotes(ch) }));
+    const chaptersText = buildBatchChaptersText(listWithNotes, {
         sceneConfig: sceneCfg,
         bookProfile,
         autoNames,
@@ -5154,6 +5175,9 @@ function niJudgeSyncSettingsUI() {
     sv('#ni-j-batch-size', niSceneConfig().batch_chapters_per_call ?? 10);
     const bptEl = q('#ni-j-batch-prompt');
     if (bptEl) bptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
+    // 安全否决开关
+    const svEl = q('#ni-j-safety-veto');
+    if (svEl) svEl.checked = niSceneConfig().safetyVetoEnabled !== false;
     // 附加特征开关
     const feat = rules.features || {};
     const fEl = (id, val) => { const el = q(id); if (el) el.checked = val !== false; };
@@ -5367,12 +5391,16 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         const preferredId = ch.enrich?.templateId || params.templateId || templates[0]?.id;
         const template = templates.find(t => t.id === preferredId) || templates[0];
         if (!template?.prompt) throw new Error('没有可用的加料模板，请先在「加料设置」中新建或恢复默认模板');
+        // 本章情报（人物卡 + 前史卡）：来自清洗管道角色表/主线节点，按文本匹配注入；
+        // 未跑清洗/无匹配时为空串，不影响消息结构。
+        const contextNotes = niChapterContextNotes(ch);
         let messages = buildEnrichMessages(template.prompt, {
             chapterContent: ch.text,
             keywords: buildEnrichKeywordsSummary(ch.judge),
             style: template.style || template.name || '',
             intensity: `${enrichIntensityLabel(params.intensity)}\n${enrichIntensityGuide(params.intensity)}`,
             minChars,
+            contextNotes,
         });
         // 预设模式：把酒馆当前预设（如「泉此方改加料」）启用的提示词拼进请求，
         // 复用项目「跟随酒馆预设」机制（createTavernPresetMessageTools）：
@@ -6187,6 +6215,12 @@ jQuery(async () => {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
         cfg.sceneConfig = { ...niSceneConfig(), batch_chapters_per_call: Math.max(1, Math.min(50, parseInt(this.value, 10) || 10)) };
         saveSettingsDebounced?.();
+    });
+    $app.on('change', '#ni-j-safety-veto', function () {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        cfg.sceneConfig = { ...niSceneConfig(), safetyVetoEnabled: this.checked };
+        saveSettingsDebounced?.();
+        toastr?.info(this.checked ? '安全否决已开启' : '安全否决已关闭（不做未成年/非自愿/多人男词法否决）');
     });
     $app.on('change', '#ni-j-batch-prompt', function () {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
