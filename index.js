@@ -5329,7 +5329,14 @@ let niEnrichTemplateSaveTimer = null;   // 模板编辑防抖保存
 async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) {
     if (!ch || !ch.text) throw new Error('章节正文为空');
     const prevStatus = ch.status;
-    if (!canEnrichChapter(ch)) throw new Error('本章无加料资格（需判定为「是/存疑」或人工标记「通过」）');
+    // 资格检查：批量队列入队时已通过 isEligible 并把章节置为 ENRICHING；
+    // canEnrichChapter 视 ENRICHING 为「进行中无资格」，此处需放行，
+    // 否则队列每章都会在入口立即抛「无加料资格」而全部失败。
+    // 直接调用（详情弹窗/行内加料）时状态非 ENRICHING，正常走资格检查。
+    if (ch.status !== CHAPTER_STATUS.ENRICHING) {
+        if (!canEnrichChapter(ch)) throw new Error('本章无加料资格（需判定为「是/存疑」或人工标记「通过」）');
+        if (!transitionChapter(ch, CHAPTER_STATUS.ENRICHING)) ch.status = CHAPTER_STATUS.ENRICHING;
+    }
     const safety = niEnrichSafety();
     if (safety.enabled && checkSensitive(ch.text, safety.sensitiveWords)) {
         const hit = checkSensitive(ch.text, safety.sensitiveWords);
@@ -5343,7 +5350,6 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         }
         throw new Error('已达每日调用限额，加料已停止');
     }
-    if (ch.status !== CHAPTER_STATUS.ENRICHING) transitionChapter(ch, CHAPTER_STATUS.ENRICHING);
     try {
         const api = niEnrichApiCfg();
         const useInd = api.useIndependentApi === true;
@@ -5505,7 +5511,9 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             ch.error = niSensitivePromptHint(err?.message || String(err));
             transitionChapter(ch, CHAPTER_STATUS.FAILED);
         } else {
-            ch.status = prevStatus;
+            // 永久错误（资格/敏感词/限额）：恢复入队前状态；
+            // 队列场景 prevStatus 为 ENRICHING（入队时已置），回退到 JUDGED 避免卡在"加料中"
+            ch.status = prevStatus === CHAPTER_STATUS.ENRICHING ? CHAPTER_STATUS.JUDGED : prevStatus;
         }
         niEnrichScheduleSave();
         throw err;
