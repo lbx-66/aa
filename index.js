@@ -419,7 +419,7 @@ const DEFAULT_SETTINGS = {
     // AI 加料（P3）
     enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
     enrichTemplates: DEFAULT_ENRICH_TEMPLATES,  // 模板库（读取走 niEnrichTemplates 克隆）
-    enrichParams: { intensity: 'medium', maxTokens: 4000, maxTokensAuto: true, minChars: ENRICH_MIN_CHARS, enforceMinChars: true },
+    enrichParams: { intensity: 'medium', maxTokens: 4000, maxTokensAuto: true, minChars: ENRICH_MIN_CHARS, enforceMinChars: false, presetSkipNames: ['接', '卡思维链（K）', '快速思维链', '涩涩加速', '不只看user'] },
     enrichSafety: { enabled: true, sensitiveWords: [] },
 };
 
@@ -5363,7 +5363,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         const templates = niEnrichTemplates();
         const params = niEnrichParams();
         const minChars = Math.max(0, Number(params.minChars) || ENRICH_MIN_CHARS);
-        const enforceMin = params.enforceMinChars !== false && minChars > 0;
+        const enforceMin = params.enforceMinChars === true && minChars > 0;
         const preferredId = ch.enrich?.templateId || params.templateId || templates[0]?.id;
         const template = templates.find(t => t.id === preferredId) || templates[0];
         if (!template?.prompt) throw new Error('没有可用的加料模板，请先在「加料设置」中新建或恢复默认模板');
@@ -5381,7 +5381,12 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         // 注意：预设只提供提示词/模型跟随，与「独立 API 连接」互不排斥（可同时勾选）。
         if (usePreset) {
             try {
-                const presetMsgs = await niBuildTavernPresetPromptMessages();
+                // 加料适配过滤：跳过对话开场/思维链引导/切镜头/加速类预设条目（诱导开场白或跑题），
+                // 丢弃 role=assistant 预填条目；名单可在 加料设置 enrichParams.presetSkipNames 扩展。
+                const presetMsgs = await niBuildTavernPresetPromptMessages({
+                    skipNames: (Array.isArray(params.presetSkipNames) ? params.presetSkipNames : DEFAULT_SETTINGS.enrichParams.presetSkipNames),
+                    dropAssistant: true,
+                });
                 if (presetMsgs.length) {
                     messages = [...presetMsgs, ...messages];
                     console.log(`[NI] 加料已拼接酒馆预设提示词 ${presetMsgs.length} 条（当前预设：${promptManager?.serviceSettings?.name || '未知'}；宏已替换；任务模板+输出规范在最后一条）`);
@@ -5778,7 +5783,7 @@ function niEnrichSyncSettingsUI() {
     if (maxAutoEl) maxAutoEl.checked = params.maxTokensAuto !== false;
     sv('#ni-e-min-chars', params.minChars ?? ENRICH_MIN_CHARS);
     const enforceMinEl = q('#ni-e-enforce-min');
-    if (enforceMinEl) enforceMinEl.checked = params.enforceMinChars !== false;
+    if (enforceMinEl) enforceMinEl.checked = params.enforceMinChars === true;
     const safetyEl = q('#ni-e-safety-enabled');
     if (safetyEl) safetyEl.checked = safety.enabled !== false;
     const wordsEl = q('#ni-e-safety-words');

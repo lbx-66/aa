@@ -1564,7 +1564,7 @@
             <label class="ni-j-cfg-lbl">最大输出长度 <input type="number" id="ni-e-max-tokens" value="4000" min="256" max="8000" step="100" style="width:84px"> tokens（手动兜底值）</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-max-auto" checked> 按模型最大值自动设定（优先取模型列表的 max_tokens；列表无信息时查内置常见模型表；均无时回退上方手动值）</label>
             <label class="ni-j-cfg-lbl">最低字数 <input type="number" id="ni-e-min-chars" value="2000" min="0" step="100" style="width:84px"> 字（写入提示词与输出规范）</label>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-enforce-min" checked> 强制达标：不足最低字数时自动追加一轮扩写；仍不足则标记失败（保留内容可重试），不再产出"短成品"</label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-enforce-min"> 强制达标：不足最低字数时自动追加一轮扩写；仍不足则标记失败（默认关闭——关闭时不足仅提示，不扩写不失败）</label>
           </div>
           <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">安全过滤</div>
