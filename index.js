@@ -358,6 +358,8 @@ function niLoadSettings() {
         saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
+    // 迁移后重新同步判定提示词 UI（niJudgeSyncSettingsUI 可能在 niLoadSettings 之前执行）
+    try { niJudgeSyncSettingsUI(); } catch (_) { /* UI 尚未就绪 */ }
     niSyncPluginToggleUI();
     syncSettingsToUI();
 }
