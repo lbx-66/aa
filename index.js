@@ -345,14 +345,16 @@ function niLoadSettings() {
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V5) {
+        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V5
+        || (saved.judgePrompts?.template && !saved.judgePrompts.template.includes('scene_type'))) {
         saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
     if (saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V4) {
+        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V4
+        || (saved.judgePrompts?.batchTemplate && !saved.judgePrompts.batchTemplate.includes('scene_type'))) {
         saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
