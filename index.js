@@ -341,12 +341,14 @@ function niLoadSettings() {
         if (saved[k] === undefined) saved[k] = DEFAULT_SETTINGS[k];
     });
     // 判定提示词迁移
+    const MARKER = '审核规避写作模式';
     if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4
         || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V5
-        || (saved.judgePrompts?.template && !saved.judgePrompts.template.includes('scene_type'))) {
+        || (saved.judgePrompts?.template && !saved.judgePrompts.template.includes(MARKER))) {
+        console.log('[NI] 判定提示词迁移：旧版 → 新版（scene_type + 审核规避）');
         saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
@@ -354,7 +356,8 @@ function niLoadSettings() {
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3
         || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V4
-        || (saved.judgePrompts?.batchTemplate && !saved.judgePrompts.batchTemplate.includes('scene_type'))) {
+        || (saved.judgePrompts?.batchTemplate && !saved.judgePrompts.batchTemplate.includes(MARKER))) {
+        console.log('[NI] 批量判定提示词迁移：旧版 → 新版（scene_type + 审核规避）');
         saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
         saveSettingsDebounced();
     }
