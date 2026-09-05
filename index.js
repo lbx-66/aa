@@ -91,6 +91,7 @@ import {
     parseBatchJudgeResponse,
     parseJudgeResponse,
     scoreIntimacy,
+    sceneTypeLabel,
 } from './lib/judge-system.js';
 
 import {
@@ -1040,7 +1041,8 @@ function niEnrichOpenDetail(id) {
             const vetoHint = ch.judge.result === 'vetoed'
                 ? '\n安全否决：该章不可自动加料。可在下方人工标记后手动处理。'
                 : '';
-            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}`;
+            const sceneTypeText = ch.judge.sceneType ? ` · 场景类型：${sceneTypeLabel(ch.judge.sceneType)}` : '';
+            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)}${sceneTypeText} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}`;
         } else if (ch.error) {
             evEl.style.display = '';
             evEl.textContent = `上次处理失败：${ch.error}\n可在列表中点「重判」或工具栏「重判失败」重试（AI 返回被截断时会自动放大输出上限重试）。`;
@@ -1628,6 +1630,34 @@ function niChapterContextNotes(ch) {
     });
 }
 
+/** 章节摘要（取前 200 字 + 标题，用于上下文链判定）。 */
+function niChapterSummary(ch) {
+    if (!ch || !ch.text) return '';
+    const title = String(ch.title || '').trim();
+    const text = String(ch.text).replace(/\s+/g, ' ').trim();
+    const summary = text.length > 200 ? text.slice(0, 200) + '…' : text;
+    return title ? `《${title}》${summary}` : summary;
+}
+
+/** 构建判定上下文链：前后章摘要（用于 AI 判定参考）。 */
+function niBuildContextChain(ch) {
+    if (!ch || !Array.isArray(S.chapters)) return '';
+    const idx = S.chapters.indexOf(ch);
+    if (idx < 0) return '';
+    const prev = idx > 0 ? S.chapters[idx - 1] : null;
+    const next = idx < S.chapters.length - 1 ? S.chapters[idx + 1] : null;
+    const parts = [];
+    if (prev) {
+        const s = niChapterSummary(prev);
+        if (s) parts.push(`前章：${s}`);
+    }
+    if (next) {
+        const s = niChapterSummary(next);
+        if (s) parts.push(`后章：${s}`);
+    }
+    return parts.length ? parts.join('\n') : '（无相邻章节信息）';
+}
+
 /** 识别「模型内容安全拦截」错误（Google Gemini 等对含敏感词的提示词直接 400 拒绝）。 */
 function niIsSensitivePromptError(err) {
     const msg = String(err?.message || err || '');
@@ -1686,9 +1716,12 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
     if (judgeNotes) {
         rulesSummary += `\n【本章人物与前史情报】\n${judgeNotes}`;
     }
+    // 上下文链：前后章摘要，帮助 AI 判断叙事弧位置
+    const contextChain = niBuildContextChain(ch);
     const messages = buildJudgeMessages(template, {
         chapterContent: ch.text,
         rulesSummary,
+        context: contextChain,
     });
     const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 800 });
     const parsed = parseJudgeResponse(raw);
@@ -1698,6 +1731,7 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
         confidence: parsed.confidence,
         evidence: parsed.evidence,
         mode: 'ai',
+        sceneType: parsed.sceneType || null,
         scenes: scenes.slice(), // 附带初筛场景窗口明细（详情/后续加料参考）
         at: Date.now(),
     };
@@ -1726,9 +1760,20 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
     for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
 
     const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
-    // 批量材料每章附带本章情报（人物卡/前史卡），AI 判定时掌握人物关系
-    const listWithNotes = list.map(ch => ({ ...ch, contextNotes: niChapterContextNotes(ch) }));
-    const chaptersText = buildBatchChaptersText(listWithNotes, {
+    // 批量材料每章附带本章情报（人物卡/前史卡）+ 上下文链（前后章摘要），AI 判定时掌握人物关系与叙事弧位置
+    const listWithCtx = list.map(ch => {
+        const item = { ...ch, contextNotes: niChapterContextNotes(ch) };
+        // 上下文链：从全书章节列表中查找前后章
+        if (Array.isArray(S.chapters)) {
+            const idx = S.chapters.indexOf(ch);
+            if (idx >= 0) {
+                if (idx > 0) item.prevSummary = niChapterSummary(S.chapters[idx - 1]);
+                if (idx < S.chapters.length - 1) item.nextSummary = niChapterSummary(S.chapters[idx + 1]);
+            }
+        }
+        return item;
+    });
+    const chaptersText = buildBatchChaptersText(listWithCtx, {
         sceneConfig: sceneCfg,
         bookProfile,
         autoNames,
@@ -1748,7 +1793,7 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
         console.warn('[NI] 批量判定 JSON 解析失败，追加格式纠正重试:', parseErr?.message || parseErr);
         const retryMessages = [...messages, {
             role: 'user',
-            content: `【格式纠正要求（必须遵守）】\n上一次输出不是有效的 JSON（原因：${parseErr?.message || parseErr}）。请重新输出：只输出一个 JSON 对象 {"chapters": [{"index": 编号, "has_gap": true或false, "confidence": 0到1的小数, "evidence": "..."}]}，不要输出任何解释、Markdown 代码围栏或其他文字；chapters 必须覆盖全部 ${list.length} 章，index 与材料章节编号一致。`,
+            content: `【格式纠正要求（必须遵守）】\n上一次输出不是有效的 JSON（原因：${parseErr?.message || parseErr}）。请重新输出：只输出一个 JSON 对象 {"chapters": [{"index": 编号, "scene_type": "explicit_sex或romantic_tension或romance或neutral或violence", "has_gap": true或false, "confidence": 0到1的小数, "evidence": "..."}]}，不要输出任何解释、Markdown 代码围栏或其他文字；chapters 必须覆盖全部 ${list.length} 章，index 与材料章节编号一致。`,
         }];
         const raw2 = await niJudgeCallRetry(retryMessages, api, signal, { baseLength: 8000 });
         byIndex = parseBatchJudgeResponse(raw2); // 仍失败则抛出（错误信息已附原始响应片段）
@@ -1777,6 +1822,7 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
             confidence: res.confidence,
             evidence: res.evidence || scored.evidence,
             mode: 'batch',
+            sceneType: res.sceneType || null,
             scenes: scored.scenes,
             safety: scored.safety,
             bookProfile: scored.bookProfile,
