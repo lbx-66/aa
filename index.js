@@ -362,7 +362,7 @@ function niLoadSettings() {
         saveSettingsDebounced();
     }
     // 迁移后重新同步判定提示词 UI（niJudgeSyncSettingsUI 可能在 niLoadSettings 之前执行）
-    try { niJudgeSyncSettingsUI(); } catch (_) { /* UI 尚未就绪 */ }
+    try { niJudgeSyncSettingsUI(); } catch (e) { console.warn('[NI] 迁移后同步判定 UI 失败:', e?.message || e); }
     niSyncPluginToggleUI();
     syncSettingsToUI();
 }
@@ -394,6 +394,12 @@ function niSwitchPage(name, btn) {
 }
 window.niSwitchPage = niSwitchPage;
 
+function niCurrentPage() {
+    const el = qa('.ni-page.on')[0];
+    if (!el) return '';
+    return el.id.replace('ni-pg-', '');
+}
+
 /**
  * 底栏导航切换（含页面附加刷新；独立于巨型初始化，任何一步失败都不影响切页）。
  */
@@ -401,6 +407,7 @@ function niNavSwitchPage(page, btn) {
     niSwitchPage(page, btn);
     try {
         if (page === 'enrich' || page === 'judge') niEnrichRenderList();
+        else if (page === 'settings') niJudgeRenderStats();
     } catch (err) {
         console.warn('[NI] 导航切换附加刷新失败:', err?.message || err);
     }
@@ -736,9 +743,21 @@ function niEnrichStatusBadge(ch) {
     return `<span class="ni-e-stat ${cls}">${label}${flagText}</span>`;
 }
 
+let _niRenderListTimer = null;
+function niDebouncedRenderList() {
+    if (_niRenderListTimer) clearTimeout(_niRenderListTimer);
+    _niRenderListTimer = setTimeout(() => {
+        _niRenderListTimer = null;
+        niEnrichRenderList();
+    }, 500);
+}
+
 function niEnrichRenderList() {
     const list = q('#ni-e-list');
     if (!list) return;
+    const curPage = niCurrentPage();
+    if (curPage === 'judge') { niJudgeRenderList(); return; }
+    if (curPage === 'enrich') { niEnrichPageRenderList(); return; }
     niJudgeRenderList();
     niEnrichPageRenderList();
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
@@ -766,7 +785,7 @@ function niEnrichRenderList() {
         return `<div class="ni-e-row${checked ? ' sel' : ''}" data-id="${niEscAttr(ch.id)}">
             <input type="checkbox" class="ni-e-chk" data-id="${niEscAttr(ch.id)}"${checked}>
             <span class="ni-e-title" data-id="${niEscAttr(ch.id)}" title="点击查看/编辑">${niEscHtml(ch.title)}</span>
-            <span class="ni-e-meta">${ch.charCount} 字</span>
+            <span class="ni-e-meta">${Number(ch.charCount) || 0} 字</span>
             ${niEnrichStatusBadge(ch)}
             <span class="ni-e-acts">
               <button class="ni-e-act" data-act="view" data-id="${niEscAttr(ch.id)}" title="查看/编辑">✎</button>
@@ -780,9 +799,10 @@ function niEnrichRenderList() {
 
 /** 判定/加料页通用章节行（无勾选框，保留查看与单章加料动作）。 */
 function niStatusRowHtml(ch, badgeHtml) {
+    if (!ch || !ch.id) return '';
     return `<div class="ni-e-row" data-id="${niEscAttr(ch.id)}">
         <span class="ni-e-title" data-id="${niEscAttr(ch.id)}" title="点击查看/编辑">${niEscHtml(ch.title)}</span>
-        <span class="ni-e-meta">${ch.charCount} 字</span>
+        <span class="ni-e-meta">${Number(ch.charCount) || 0} 字</span>
         ${badgeHtml}
         <span class="ni-e-acts">
             <button class="ni-e-act" data-act="view" data-id="${niEscAttr(ch.id)}" title="查看/编辑">✎</button>
@@ -1410,9 +1430,15 @@ async function niEnrichSaveChapters() {
         return true;
     } catch (e) {
         console.warn('[NI] 章节数据保存失败:', e);
+        if (!niEnrichSaveWarned) {
+            niEnrichSaveWarned = true;
+            toastr?.error('章节数据保存失败，请检查服务端存储空间');
+            setTimeout(() => { niEnrichSaveWarned = false; }, 30000);
+        }
         return false;
     }
 }
+let niEnrichSaveWarned = false;
 
 function niEnrichNormalizeChapter(ch) {
     return {
@@ -1648,11 +1674,12 @@ function niChapterSummary(ch) {
 
 /** 构建判定上下文链：前后章摘要（用于 AI 判定参考）。 */
 function niBuildContextChain(ch) {
-    if (!ch || !Array.isArray(S.chapters)) return '';
-    const idx = S.chapters.indexOf(ch);
+    const chapters = S.enrichChapters;
+    if (!ch || !Array.isArray(chapters)) return '';
+    const idx = chapters.indexOf(ch);
     if (idx < 0) return '';
-    const prev = idx > 0 ? S.chapters[idx - 1] : null;
-    const next = idx < S.chapters.length - 1 ? S.chapters[idx + 1] : null;
+    const prev = idx > 0 ? chapters[idx - 1] : null;
+    const next = idx < chapters.length - 1 ? chapters[idx + 1] : null;
     const parts = [];
     if (prev) {
         const s = niChapterSummary(prev);
@@ -1682,9 +1709,10 @@ function niSensitivePromptHint(msg) {
 async function niJudgeCallRetry(messages, api, signal, { baseLength = 800 } = {}) {
     const retries = Math.max(0, Number(api.retries) || 0);
     let truncatedCount = 0;
+    let errCount = 0;
     let raw = '';
     let lastErr = null;
-    for (let attempt = 0; attempt <= retries; attempt++) {
+    while (true) {
         if (signal?.aborted) throw new Error('AbortError');
         try {
             raw = await niJudgeCall(messages, { responseLength: judgeResponseLength(truncatedCount, baseLength), signal });
@@ -1694,12 +1722,20 @@ async function niJudgeCallRetry(messages, api, signal, { baseLength = 800 } = {}
             lastErr = err;
             if (isTruncatedError(err)) {
                 truncatedCount++;
-                console.warn(`[NI] 判定返回被长度截断（第 ${attempt + 1} 次），已放大输出上限到 ${judgeResponseLength(truncatedCount, baseLength)} tokens`);
+                if (truncatedCount > 3) {
+                    console.warn('[NI] 判定截断重试已达 3 次上限，放弃重试');
+                    throw lastErr;
+                }
+                console.warn(`[NI] 判定返回被长度截断（第 ${truncatedCount} 次），已放大输出上限到 ${judgeResponseLength(truncatedCount, baseLength)} tokens`);
+                continue;
             }
-            if (attempt < retries) await new Promise(r => setTimeout(r, 800 * (attempt + 1)));
+            errCount++;
+            if (errCount > retries) {
+                throw lastErr;
+            }
+            await new Promise(r => setTimeout(r, 800 * errCount));
         }
     }
-    throw lastErr || new Error('判定 API 无返回内容');
 }
 
 /** AI 深度判定单个章节（含截断放大重试）；供纯 AI 模式与混合模式的精判阶段使用。
@@ -1771,11 +1807,11 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
     const listWithCtx = list.map(ch => {
         const item = { ...ch, contextNotes: niChapterContextNotes(ch) };
         // 上下文链：从全书章节列表中查找前后章
-        if (Array.isArray(S.chapters)) {
-            const idx = S.chapters.indexOf(ch);
+        if (Array.isArray(S.enrichChapters)) {
+            const idx = S.enrichChapters.indexOf(ch);
             if (idx >= 0) {
-                if (idx > 0) item.prevSummary = niChapterSummary(S.chapters[idx - 1]);
-                if (idx < S.chapters.length - 1) item.nextSummary = niChapterSummary(S.chapters[idx + 1]);
+                if (idx > 0) item.prevSummary = niChapterSummary(S.enrichChapters[idx - 1]);
+                if (idx < S.enrichChapters.length - 1) item.nextSummary = niChapterSummary(S.enrichChapters[idx + 1]);
             }
         }
         return item;
@@ -1895,8 +1931,8 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
         return judge;
     } catch (err) {
         if (signal?.aborted || err?.message === 'AbortError') throw err;
-        // 已有可疑标记时保留标记（AI 精判失败可再次重试），仅记录错误
-        if (!ch.judge?.hybridPending) ch.error = niSensitivePromptHint(err?.message || String(err));
+        // 无论是否保留 hybridPending 标记，都记录错误信息供 UI 显示
+        ch.error = niSensitivePromptHint(err?.message || String(err));
         transitionChapter(ch, CHAPTER_STATUS.FAILED);
         niEnrichScheduleSave();
         throw err;
@@ -1999,6 +2035,7 @@ function niJudgeOnProgress(p) {
     }
     if (note) note.textContent = p.note || (p.running ? `已完成 ${p.done}/${p.total}` : '');
     niJudgeSyncButtons(!!p.running);
+    niDebouncedRenderList();
     if (!p.running) {
         _niJudgeRefinePass = false;
         _niJudgeKeywordPass = false;
@@ -2041,6 +2078,7 @@ function niJudgeRenderStats() {
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const c = { undetected: 0, detecting: 0, judged: 0, failed: 0, skipped: 0, modified: 0, suspicious: 0, other: 0 };
     chapters.forEach(ch => {
+        if (!ch) return;
         if (ch.status === CHAPTER_STATUS.JUDGED && ch.judge?.hybridPending) { c.suspicious++; return; }
         if (c[ch.status] != null) c[ch.status]++; else c.other++;
     });
@@ -2529,6 +2567,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
                 }
             } else {
                 console.warn('[NI] 加料字数补足扩写失败:', lastErr2?.message || lastErr2);
+                if (ch.enrich) ch.enrich.boostFailed = true;
             }
             addedLen = segments.reduce((sum, seg) => sum + String(seg.content || '').length, 0);
         }
@@ -2571,7 +2610,8 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         } else {
             // 永久错误（资格/敏感词/限额）：恢复入队前状态；
             // 队列场景 prevStatus 为 ENRICHING（入队时已置），回退到 JUDGED 避免卡在"加料中"
-            ch.status = prevStatus === CHAPTER_STATUS.ENRICHING ? CHAPTER_STATUS.JUDGED : prevStatus;
+            const restoreStatus = prevStatus === CHAPTER_STATUS.ENRICHING ? CHAPTER_STATUS.JUDGED : prevStatus;
+            if (!transitionChapter(ch, restoreStatus)) ch.status = restoreStatus;
         }
         niEnrichScheduleSave();
         throw err;
@@ -2625,6 +2665,7 @@ function niEnrichOnProgress(p) {
     }
     if (note) note.textContent = p.note || (p.running ? `已完成 ${p.done}/${p.total}` : '');
     niEnrichSyncButtons(!!p.running);
+    niDebouncedRenderList();
     if (!p.running) {
         _niEnrichQuotaWarned = false;
         niEnrichRenderStats();
@@ -2638,7 +2679,7 @@ function niEnrichRenderStats() {
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     let pending = 0, enriching = 0, enriched = 0, failed = 0, skipped = 0, reviewed = 0, noContent = 0;
     chapters.forEach(ch => {
-        if (ch.filtered) return;
+        if (!ch || ch.filtered) return;
         if (ch.status === CHAPTER_STATUS.ENRICHING) enriching++;
         else if (ch.status === CHAPTER_STATUS.FAILED) failed++;
         else if (ch.status === CHAPTER_STATUS.SKIPPED) skipped++;
@@ -3421,6 +3462,16 @@ jQuery(async () => {
     $app.on('change', '#ni-import-fi', function() {
         const f = this.files?.[0];
         if (f) { niImportData(f); this.value = ''; }
+    });
+
+    // 页面卸载时兜底保存，防止 debounced 保存丢失
+    window.addEventListener('beforeunload', () => {
+        if (Array.isArray(S.enrichChapters) && S.enrichChapters.length) {
+            niEnrichScheduleSave({ immediate: true });
+        }
+        if (niAutosave?._timer) { clearTimeout(niAutosave._timer); niAutosave._timer = null; saveSettingsDebounced?.(); }
+        if (_niEnrichSaveTimer) { clearTimeout(_niEnrichSaveTimer); _niEnrichSaveTimer = null; }
+        if (_niRenderListTimer) { clearTimeout(_niRenderListTimer); _niRenderListTimer = null; }
     });
 
     console.log('[NI] 小说加料插件 加载完成');
