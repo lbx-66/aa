@@ -244,9 +244,9 @@
           <div class="ni-j-cfg-group" id="ni-j-batch-group" style="display:none">
             <div class="ni-ctitle-label">批量场景扫描（一次调用判定 N 章）</div>
             <label class="ni-j-cfg-lbl">每批章数
-              <input type="number" id="ni-j-batch-size" value="10" min="1" max="50" style="width:64px">
+              <input type="number" id="ni-j-batch-size" value="6" min="1" max="50" style="width:64px">
             </label>
-            <div class="ni-desc" style="margin:2px 0 6px">「开始判定」时按此章数分组：本地场景引擎先提取每章场景窗口原文打包给 AI，AI 逐章标记「有缺口/无缺口/存疑/安全排除」；标记「是/存疑」的章节后续单独走 AI 加料。</div>
+            <div class="ni-desc" style="margin:2px 0 6px">「开始判定」时按此章数分组：本地场景引擎先提取每章场景窗口原文打包给 AI，AI 逐章标记「有缺口/无缺口/存疑/安全排除」；标记「是/存疑」的章节后续单独走 AI 加料。批量越小，每章材料占比越高、判定越稳（默认 6）。</div>
             <div class="ni-ctitle-label">批量判定提示词模板</div>
             <textarea id="ni-j-batch-prompt" class="ni-j-prompt-textarea" rows="8" spellcheck="false"></textarea>
             <div class="ni-desc" style="margin:2px 0 0">变量：{chapters} 逐章场景材料、{rules} 规则摘要</div>

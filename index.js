@@ -52,17 +52,13 @@ import { createBatchQueueController } from './lib/batch-queue.js';
 
 import {
     PersistedRateQueue,
-    concurrencyLimit,
     createChatCompletionResponseTools,
-    createGlobalPromptTools,
-    createNovelApiClient,
     createProfileApiClient,
     createTavernPresetMessageTools,
     DynamicSemaphore,
     niApplyModelListToControls,
     niFetchModelIds,
     niLoadModelList,
-    niNormalizeGlobalPromptSource,
     runWithSemaphore,
 } from './lib/api-system.js';
 
@@ -185,7 +181,7 @@ const DEFAULT_SETTINGS = {
     enrichShortcutsEnabled: true,
     judgeRules: DEFAULT_JUDGE_RULES,
     judgePrompts: { template: DEFAULT_JUDGE_PROMPT, batchTemplate: BATCH_JUDGE_PROMPT },
-    judgeApi: { url: '', key: '', model: '', stream: false, timeoutSec: 60, retries: 2, temperature: 0.3 },
+    judgeApi: { url: '', key: '', model: '', stream: false, timeoutSec: 60, retries: 2, temperature: 0.15 },
     sceneConfig: DEFAULT_SCENE_CONFIG,
     enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
     enrichTemplates: DEFAULT_ENRICH_TEMPLATES,
@@ -1134,6 +1130,9 @@ function niEnrichOpenDetail(id) {
             if (ch.judge.carryover?.suppressed) {
                 extraNote += `\n（关键词引擎已排除 ${ch.judge.carryover.suppressed} 处承接上一章场景的窗口${ch.judge.carryover.carryoverOnly ? '，本章按承接处理' : ''}）`;
             }
+            if (ch.judge.lowEvidence) {
+                extraNote += '\n（复核提示：判定缺少本地场景窗口佐证，请核对 evidence 后再决定是否加料）';
+            }
             evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)}${sceneTypeText}${subtypeText} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}${extraNote}`;
         } else if (ch.error) {
             evEl.style.display = '';
@@ -1897,21 +1896,26 @@ function niBuildContextChain(ch) {
     return parts.length ? parts.join('\n') : '（无相邻章节信息）';
 }
 
-/** 跨章归位用的"上一章末尾铺垫"信号词（宁缺毋滥：命中才允许把缺口回指到上一章章末）。 */
+/** 跨章归位用的"上一章末尾铺垫"信号词（宁缺毋滥）：
+ *  - 只保留"当晚性爱场景"强指向的隐私空间/脱衣/上床/亲密动作词；
+ *  - 不含 暧昧/缠绵/温存/情动/燥热 等剧情情绪泛词（曾因"关系比较暧昧"
+ *    这类日常句误把日常章提升为章末补全）；
+ *  - 判定门槛为尾段命中 ≥2 个不同词，单词命中不提升。
+ */
 const NI_SEAM_SCAFFOLD_MARKS = [
-    '独处', '关上门', '关灯', '熄灯', '灭烛', '吹灭', '吹灯', '烛火',
+    '关上门', '关灯', '熄灯', '灭烛', '吹灭', '吹灯', '烛火',
     '褪去', '褪下', '解开衣', '衣襟', '衣衫', '罗衫', '上床', '同榻',
     '榻上', '床榻', '床笫', '卧室', '内室', '闺房', '香闺', '吻住',
-    '深吻', '亲吻', '抚摸', '爱抚', '搂住', '搂在', '相拥', '拥入',
-    '缠绵', '暧昧', '情动', '动情', '温存', '留宿', '今夜留下来',
-    '别走', '陪陪我', '软在', '燥热', '情热', '气息乱了', '意乱情迷',
+    '深吻', '爱抚', '搂住', '搂在', '相拥', '拥入',
+    '留宿', '今夜留下来', '别走', '陪陪我', '软在', '意乱情迷',
 ];
 
-/** 上一章末尾是否留有可承接的铺垫（约末尾 420 字内命中信号词）。 */
+/** 上一章末尾是否留有可承接的铺垫（约末尾 420 字内命中 ≥2 个不同信号词）。 */
 function niChapterTailHasSeamScaffold(ch) {
     if (!ch?.text) return false;
     const tail = String(ch.text).slice(-420);
-    return NI_SEAM_SCAFFOLD_MARKS.some(m => tail.includes(m));
+    const marks = NI_SEAM_SCAFFOLD_MARKS.filter(m => tail.includes(m));
+    return marks.length >= 2;
 }
 
 /**
@@ -2089,6 +2093,29 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
     // 非核心窗口需要核实前章；普通章节仅带前章摘要/判定行（前章判定行很便宜但信息量最大）。
     const listWithCtx = list.map(ch => {
         const item = { ...ch, contextNotes: niChapterContextNotes(ch) };
+        const scored = scoredByIndex.get(ch.index);
+        const wins = Array.isArray(scored?.scenes) ? scored.scenes : [];
+        // 本章开头片段（通用材料补足）：窗口摘录只覆盖省略/事后窗口附近，无法判断
+        // 「当晚铺垫是否在本章前部」。给两类章附开头文本——
+        //  (a) 完全无窗口的章（AI 手里将没有任何本章原文，容易凭相邻章信息臆断）；
+        //  (b) 窗口很少且全部为非核心（省略/事后/隐喻型）的章（需要看铺垫位置以区分
+        //      「本章内闭环省略」vs「承接上一章/两章间省略」）。
+        const noWindow = wins.length === 0;
+        const fewNonCoreWindows = wins.length > 0 && wins.length <= 2 && wins.every(w => {
+            const coreHits = ((w?.stages?.oral || []).length + (w?.stages?.penetration || []).length) > 0;
+            return !coreHits;
+        });
+        if (noWindow) {
+            // 无窗口章的判定素材最少：给「章首 300 + 章尾 300」双端短摘——
+            // 章首用于承接/闭环定位，章尾用于捕捉收尾类信号（如性唤起后奔向独处的暗示）
+            const h = niChapterHead(ch, 300);
+            if (h) item.headSnippet = h;
+            const tl = niChapterTail(ch, 300);
+            if (tl) item.tailSnippet = tl;
+        } else if (fewNonCoreWindows) {
+            const h = niChapterHead(ch, 1100);
+            if (h) item.headSnippet = h;
+        }
         // 上下文链：取全书中本章前/后最近的未过滤章节（filtered 短章不入流程，跳过）
         const { prev, next } = niKeptNeighbors(ch);
         if (prev) {
@@ -2098,15 +2125,13 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
             if (jl) item.prevJudge = jl;
             // 疑似承接章才附前章尾段（判定行/摘要始终保留）
             const prevExplicit = prev?.judge?.sceneType === 'explicit_sex' || prev?.judge?.result === 'yes';
-            const scored = scoredByIndex.get(ch.index);
-            const hasCarryoverCandidate = Array.isArray(scored?.scenes)
-                && scored.scenes.some(w => {
-                    const coreHits = ((w?.stages?.oral || []).length + (w?.stages?.penetration || []).length) > 0;
-                    if (coreHits) return false; // 本章有自有核心场景，正常按新场景判
-                    const dec = w?.decision;
-                    return dec === 'insert_full_scene' || dec === 'insert_before_aftermath'
-                        || (w?.stages?.aftermath || []).length > 0;
-                });
+            const hasCarryoverCandidate = wins.some(w => {
+                const coreHits = ((w?.stages?.oral || []).length + (w?.stages?.penetration || []).length) > 0;
+                if (coreHits) return false; // 本章有自有核心场景，正常按新场景判
+                const dec = w?.decision;
+                return dec === 'insert_full_scene' || dec === 'insert_before_aftermath'
+                    || (w?.stages?.aftermath || []).length > 0;
+            });
             if (prevExplicit || hasCarryoverCandidate) {
                 const tl = niChapterTail(prev, 240);
                 if (tl) item.prevTail = tl;
@@ -2162,15 +2187,25 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
             continue;
         }
         const isDoubt = res.confidence < aiThreshold;
+        // 低证据护栏（通用输出校验）：本地场景引擎零窗口（材料里没有任何本章场景词面证据）
+        // 而 AI 判 explicit_sex/是 时，判定缺少本地佐证——不自动改判（AI 语义可能超出词表），
+        // 但在证据与详情中显著提示人工复核
+        const aiExplicit = res.sceneType === 'explicit_sex' || res.result === 'yes';
+        const lowEvidence = aiExplicit === true && (scored.hitCount || 0) === 0;
+        let evidence = res.evidence || scored.evidence;
+        if (lowEvidence) {
+            evidence = `【复核提示】本章材料未发现任何场景窗口，AI 判定缺少本地词面佐证，请人工复核后再加料。\n${evidence}`;
+        }
         ch.judge = {
             result: isDoubt ? 'doubt' : res.result,
             confidence: res.confidence,
-            evidence: res.evidence || scored.evidence,
+            evidence,
             mode: 'batch',
             sceneType: res.sceneType || null,
             sceneSubtype: res.sceneSubtype,
             enrichHints: Array.isArray(res.enrichHints) ? res.enrichHints : [],
             gapInPrev: res.gapInPrev === true,
+            lowEvidence: lowEvidence || undefined,
             scenes: scored.scenes,
             safety: scored.safety,
             bookProfile: scored.bookProfile,
@@ -2267,7 +2302,7 @@ function niJudgeQueueEligible(ch) {
 /** 批量模式：把待判定章节按每批章数分组（每组 = 队列一项，一次 AI 调用）。 */
 function niJudgeBatchGroups() {
     const chapters = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).filter(niJudgeQueueEligible);
-    const batchSize = Math.max(1, Number(niSceneConfig().batch_chapters_per_call) || 10);
+    const batchSize = Math.max(1, Number(niSceneConfig().batch_chapters_per_call) || 6);
     const groups = [];
     for (let i = 0; i < chapters.length; i += batchSize) {
         groups.push(chapters.slice(i, i + batchSize));
@@ -2571,7 +2606,7 @@ function niJudgeSyncSettingsUI() {
     const ptEl = q('#ni-j-prompt');
     if (ptEl) ptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.template || DEFAULT_JUDGE_PROMPT;
     // 批量场景扫描：每批章数 + 批量模板
-    sv('#ni-j-batch-size', niSceneConfig().batch_chapters_per_call ?? 10);
+    sv('#ni-j-batch-size', niSceneConfig().batch_chapters_per_call ?? 6);
     const bptEl = q('#ni-j-batch-prompt');
     if (bptEl) bptEl.value = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
     // 安全否决开关
@@ -3591,7 +3626,7 @@ jQuery(async () => {
     });
     $app.on('change', '#ni-j-batch-size', function () {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
-        cfg.sceneConfig = { ...niSceneConfig(), batch_chapters_per_call: Math.max(1, Math.min(50, parseInt(this.value, 10) || 10)) };
+        cfg.sceneConfig = { ...niSceneConfig(), batch_chapters_per_call: Math.max(1, Math.min(50, parseInt(this.value, 10) || 6)) };
         saveSettingsDebounced?.();
     });
     $app.on('change', '#ni-j-safety-veto', function () {
