@@ -4002,3 +4002,43 @@ select.ni-modal-input {
   .ni-euz { min-height: 64px; }
   .ni-upload-zone { padding: 10px; }
 }
+
+/* ============ 判定结果分类 / 可加料章节（可收纳区块） ============ */
+.ni-j-sec { border-top: 1px dashed rgba(127,127,127,.25); }
+.ni-j-sec-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 2px 5px; cursor: pointer; user-select: none;
+  font-size: 14px; font-weight: 600; color: var(--ni-text, currentColor);
+}
+.ni-j-sec-head:hover { opacity: .85; }
+.ni-j-sec-label { display: inline-flex; align-items: center; gap: 6px; }
+.ni-j-sec-meta { font-weight: 400; font-size: 12px; opacity: .7; margin-left: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ni-j-sec-chev { margin-left: auto; font-size: 14px; transition: transform .2s; color: var(--color-text-tertiary, #888); }
+.ni-j-sec-head:not(.open) .ni-j-sec-chev { transform: rotate(-90deg); }
+.ni-j-sec-body { padding: 2px 0 8px; }
+.ni-j-sec-head:not(.open) + .ni-j-sec-body { display: none; }
+
+/* 分类组 */
+.ni-type-group { margin: 2px 0; }
+.ni-type-head {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  padding: 5px 4px; margin: 2px 0; cursor: pointer; user-select: none;
+  background: rgba(127,127,127,.08); border: none; border-radius: 6px;
+  font-size: 13px; font-weight: 600; text-align: left;
+  color: var(--ni-text, currentColor);
+}
+.ni-type-head:hover { background: rgba(127,127,127,.16); }
+.ni-type-head .ni-type-caret { font-size: 10px; opacity: .7; transition: transform .2s; display: inline-block; }
+.ni-type-head.open .ni-type-caret { transform: rotate(90deg); }
+.ni-type-count { margin-left: auto; font-weight: 400; font-size: 12px; opacity: .75; }
+.ni-type-body { display: none; padding: 2px 2px 4px 14px; }
+.ni-type-head.open + .ni-type-body { display: block; }
+.ni-type-ch {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 4px; cursor: pointer; border-radius: 4px;
+  font-size: 13px; overflow: hidden;
+}
+.ni-type-ch:hover { background: rgba(127,127,127,.12); }
+.ni-type-ch-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.ni-type-ch-meta { flex: none; font-size: 11px; opacity: .7; white-space: nowrap; }
+.ni-type-empty { padding: 8px 4px; font-size: 13px; opacity: .6; }

@@ -841,14 +841,16 @@ function niJudgeRenderList() {
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const eligible = chapters.filter(ch => !ch.filtered && canEnrichChapter(ch));
     const cap = q('#ni-j-list-cap');
-    if (cap) cap.textContent = eligible.length ? `可加料章节：共 ${eligible.length} 章` : '';
+    if (cap) cap.textContent = eligible.length ? `共 ${eligible.length} 章` : '';
     if (!eligible.length) {
         list.innerHTML = '<div class="ni-empty"><i class="ti ti-scan"></i>暂无「可加料」章节（判定为「是/存疑」或标记「通过」后显示在此）</div>';
-        return;
+    } else {
+        list.innerHTML = eligible.map(ch => niStatusRowHtml(ch,
+            `<span class="ni-e-stat ni-es-d" title="判定已通过，可进行 AI 加料">可加料</span>`
+        )).join('');
     }
-    list.innerHTML = eligible.map(ch => niStatusRowHtml(ch,
-        `<span class="ni-e-stat ni-es-d" title="判定已通过，可进行 AI 加料">可加料</span>`
-    )).join('');
+    // 判定结果分类分组列表与「可加料章节」区块同步刷新
+    niJudgeRenderTypeGroups();
 }
 
 /** 加料页：显示需要加料的章节，按状态区分 已加料 / 加料中 / 未加料 / 失败 / 已跳过。 */
@@ -1437,12 +1439,13 @@ function niEnrichRenderHistory() {
     const history = extension_settings[EXT_NAME]?.enrichHistory || [];
     if (!history.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
     el.style.display = 'block';
-    el.innerHTML = '<div class="ni-desc" style="margin:8px 0 4px">最近导入（↻ 重新选择该文件导入）</div>' +
+    el.innerHTML = '<div class="ni-desc" style="margin:8px 0 4px">最近导入（↻ 重新选择该文件导入 · ✕ 删除记录）</div>' +
         history.map((h, i) => `
         <div class="ni-e-hrow">
             <span class="ni-e-title" style="cursor:default" title="${niEscAttr(h.name)}">${niEscHtml(h.name)}</span>
             <span class="ni-e-meta">${h.chapterCount ?? '?'} 章 · ${new Date(h.importedAt).toLocaleString()}</span>
             <button class="ni-e-act" data-hist="${i}" title="重新导入该文件">↻</button>
+            <button class="ni-e-act danger" data-hist-del="${i}" title="删除该条历史记录">✕</button>
         </div>`).join('');
 }
 
@@ -2448,6 +2451,82 @@ function niJudgeRenderStats() {
     el.textContent = parts.join(' · ');
 }
 
+// —— 判定结果分类（按 scene_type 分组罗列，组可收纳展开）——
+const NI_JUDGE_TYPE_ORDER = ['explicit_sex', 'romantic_tension', 'romance', 'neutral', 'violence'];
+const NI_JUDGE_TYPE_LABELS = {
+    explicit_sex: '性爱情节',
+    romantic_tension: '暧昧张力',
+    romance: '纯爱',
+    neutral: '无',
+    violence: '暴力',
+    vetoed: '安全否决',
+    unclassified: '未分类（旧格式/手动）',
+};
+// 展开状态（纯 UI 记忆；默认分类组全部折叠，只显示组头概览）
+let _niJudgeTypeOpenGroups = new Set();
+
+/** 章节 → 分类键（安全否决单独成组；无 scene_type 的旧数据归未分类）。 */
+function niJudgeTypeKey(ch) {
+    if (!ch?.judge) return null;
+    if (ch.judge.result === 'vetoed') return 'vetoed';
+    const st = ch.judge.sceneType;
+    return st && NI_JUDGE_TYPE_ORDER.includes(st) ? st : 'unclassified';
+}
+
+/** 渲染判定结果分类分组（判定页「判定结果分类」区块）。 */
+function niJudgeRenderTypeGroups() {
+    const body = q('#ni-j-type-body');
+    if (!body) return;
+    const meta = q('#ni-j-type-meta');
+    const chapters = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).filter(c => c && !c.filtered && c.judge);
+    // 先清理已不存在的展开组 id（章节重排/删除后残留无碍，但避免陈旧 key）
+    const groups = new Map();
+    for (const ch of chapters) {
+        const key = niJudgeTypeKey(ch);
+        if (key === null) continue;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(ch);
+    }
+    const alive = new Set(groups.keys());
+    for (const k of [..._niJudgeTypeOpenGroups]) {
+        if (!alive.has(k)) _niJudgeTypeOpenGroups.delete(k);
+    }
+    // 区块头简况
+    const brief = [];
+    for (const k of [...NI_JUDGE_TYPE_ORDER, 'vetoed', 'unclassified']) {
+        const n = (groups.get(k) || []).length;
+        if (n > 0) brief.push(`${NI_JUDGE_TYPE_LABELS[k]}${n}`);
+    }
+    if (meta) meta.textContent = brief.length ? brief.join(' / ') : '未判定';
+    if (!chapters.length) {
+        body.innerHTML = '<div class="ni-type-empty">还没有判定结果：先运行判定，结果会按 性爱情节 / 暧昧张力 / 纯爱 / 无 / 暴力 / 安全否决 分组展示。</div>';
+        return;
+    }
+    const order = [...NI_JUDGE_TYPE_ORDER, 'vetoed', 'unclassified'];
+    const html = order.filter(k => groups.has(k)).map(k => {
+        const list = groups.get(k).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
+        const open = _niJudgeTypeOpenGroups.has(k);
+        const rows = list.map(ch => {
+            const conf = ch.judge?.confidence;
+            let enrichTag = '';
+            if (ch.enrich?.noContent) enrichTag = ' · 无加料';
+            else if (ch.enrich?.text) enrichTag = ch.enrich.reviewed === false ? ' · 需审核' : ' · 已加料';
+            const metaText = `${Number(ch.charCount) || 0}字${conf != null ? ` · 置信度 ${conf}` : ''}${enrichTag}`;
+            return `<div class="ni-type-ch" data-id="${niEscAttr(ch.id)}" title="点击查看/编辑章节">
+                <span class="ni-type-ch-title">${niEscHtml(ch.title || '')}</span>
+                <span class="ni-type-ch-meta">${niEscHtml(metaText)}</span>
+            </div>`;
+        }).join('');
+        return `<div class="ni-type-group">
+            <button type="button" class="ni-type-head${open ? ' open' : ''}" data-type-key="${k}" title="点击展开/收起">
+                <span class="ni-type-caret">▶</span>${NI_JUDGE_TYPE_LABELS[k]}<span class="ni-type-count">${list.length} 章</span>
+            </button>
+            <div class="ni-type-body">${rows}</div>
+        </div>`;
+    }).join('');
+    body.innerHTML = html || '<div class="ni-type-empty">还没有判定结果。</div>';
+}
+
 function niJudgeSyncButtons(running) {
     const startBtn = q('#ni-btn-judge');
     const pauseBtn = q('#ni-btn-judge-pause');
@@ -3397,6 +3476,19 @@ jQuery(async () => {
     $app.on('click', '.ni-e-act', async function () {
         const act = this.dataset.act;
         const id = this.dataset.id;
+        // 历史记录删除（data-hist-del=索引）
+        if (this.dataset.histDel !== undefined) {
+            const settings = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+            const history = Array.isArray(settings.enrichHistory) ? settings.enrichHistory : [];
+            const item = history[Number(this.dataset.histDel)];
+            if (!item) return;
+            if (!confirm(`删除历史记录「${item.name}」？（仅删除该条记录，不影响当前已导入的章节）`)) return;
+            history.splice(Number(this.dataset.histDel), 1);
+            settings.enrichHistory = history;
+            saveSettingsDebounced?.();
+            niEnrichRenderHistory();
+            return;
+        }
         if (act === 'view' && id) {
             niEnrichOpenDetail(id);
         } else if (act === 'del' && id) {
@@ -3499,6 +3591,27 @@ jQuery(async () => {
 
     // ── 判定卡片（工具栏按钮已由 niBindGlobalActions() 全局分发，见 niBindGlobalActions）──
     $app.on('click', '#ni-j-cfg-btn', () => niTogglePanel('ni-j-settings', 'ni-j-cfg-btn'));
+
+    // 判定结果分类 / 可加料章节 两个可收纳区块（点击头收纳/展开）
+    $app.on('click', '#ni-j-type-head', function () {
+        this.classList.toggle('open');
+    });
+    $app.on('click', '#ni-j-eligible-head', function () {
+        this.classList.toggle('open');
+    });
+    // 分类组头：展开/收起该组（状态记忆在 _niJudgeTypeOpenGroups）
+    $app.on('click', '.ni-type-head', function () {
+        const key = this.dataset.typeKey;
+        if (!key) return;
+        if (_niJudgeTypeOpenGroups.has(key)) _niJudgeTypeOpenGroups.delete(key);
+        else _niJudgeTypeOpenGroups.add(key);
+        this.classList.toggle('open');
+    });
+    // 分类组内章节行 → 打开详情
+    $app.on('click', '.ni-type-ch', function () {
+        const id = this.dataset.id;
+        if (id) niEnrichOpenDetail(id);
+    });
 
     // 判定引擎（并列勾选：关键词/AI/批量）
     $app.on('change', '#ni-j-engine-keyword, #ni-j-engine-ai, #ni-j-engine-batch, #ni-j-ai-scope', function () {

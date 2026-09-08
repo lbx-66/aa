@@ -216,8 +216,26 @@
           <button class="ni-e-btn" id="ni-btn-judge-csv">导出判定报告(CSV)</button>
         </div>
         <div class="ni-desc" id="ni-j-stats" style="margin-bottom:6px"></div>
-        <div class="ni-desc" id="ni-j-list-cap" style="margin:4px 0 2px"></div>
-        <div class="ni-chunk-list" id="ni-j-list" style="max-height:260px"></div>
+        <!-- 判定结果分类（按 scene_type 分组罗列，可收纳） -->
+        <div class="ni-j-sec">
+          <div class="ni-j-sec-head open" id="ni-j-type-head" role="button" tabindex="0" title="点击收纳/展开">
+            <span class="ni-j-sec-label">判定结果分类</span>
+            <span class="ni-j-sec-meta" id="ni-j-type-meta"></span>
+            <i class="ni-j-sec-chev ti ti-chevron-down"></i>
+          </div>
+          <div class="ni-j-sec-body" id="ni-j-type-body"></div>
+        </div>
+        <!-- 可加料章节（可收纳） -->
+        <div class="ni-j-sec">
+          <div class="ni-j-sec-head open" id="ni-j-eligible-head" role="button" tabindex="0" title="点击收纳/展开">
+            <span class="ni-j-sec-label">可加料章节</span>
+            <span class="ni-j-sec-meta" id="ni-j-list-cap"></span>
+            <i class="ni-j-sec-chev ti ti-chevron-down"></i>
+          </div>
+          <div class="ni-j-sec-body" id="ni-j-eligible-body">
+            <div class="ni-chunk-list" id="ni-j-list" style="max-height:260px"></div>
+          </div>
+        </div>
         <div class="ni-j-settings-panel" id="ni-j-settings">
           <div class="ni-j-cfg-group" id="ni-j-mode-group">
             <div class="ni-ctitle-label">判定引擎（并列勾选，至少一个）</div>
