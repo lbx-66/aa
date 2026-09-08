@@ -1,4 +1,4 @@
-﻿<div class="ni-app" id="ni-app">
+<div class="ni-app" id="ni-app">
   <div class="ni-scroll" id="ni-scroll">
 
     <!-- ========== PAGE: SETTINGS ==========-->
@@ -9,10 +9,11 @@
         <div class="ni-ctitle"><span class="ni-ctitle-label"><i class="ti ti-device-floppy"></i>自动保存</span></div>
         <label class="ni-toggle-label ni-autosave-row" id="ni-autosave-row" for="ni-autosave-chk">
           <i class="ti ti-device-floppy" aria-hidden="true"></i>
-          <span>自动保存</span>
+          <span>自动保存章节进度</span>
           <input type="checkbox" id="ni-autosave-chk">
           <span class="ni-cfg-chk"><i class="ti ti-check"></i></span>
         </label>
+        <p class="ni-desc" style="margin:6px 2px 2px">开启：判定/加料进度自动写入服务器文件（含小说原文与生成内容），刷新/重开可恢复上次进度；关闭：进度仅保留在内存，不自动上传（队列结束、暂停、导入等关键点仍会落盘一次）。</p>
       </div>
 
       <div class="ni-card" id="ni-theme-card">
@@ -130,11 +131,11 @@
       <!-- 导入/导出-->
       <div class="ni-card">
         <div class="ni-ctitle"><span class="ni-ctitle-label"><i class="ti ti-transfer"></i>导入 / 导出</span></div>
-        <p class="ni-desc">将章节数据、判定与加料结果、模板、规则及非敏感设置打包为 ZIP 文件，可用于跨设备迁移或备份恢复。API 地址、模型和 Key 不会导出。旧版 JSON 文件仍可导入。</p>
+        <p class="ni-desc">将章节数据、判定与加料结果、模板、规则及非敏感设置导出为 JSON 备份文件，可用于跨设备迁移或备份恢复。API 地址与 Key 不会导出（模型名会保留，恢复后只需重填地址与 Key）。旧版备份文件仍可导入。</p>
         <div class="ni-tool-row" style="flex-wrap:wrap;gap:8px">
-          <button class="ni-btn ni-btn-p ni-btn-inline" id="ni-export-btn"><i class="ti ti-file-export"></i>导出 ZIP</button>
-          <button class="ni-btn ni-btn-w ni-btn-inline" id="ni-import-btn"><i class="ti ti-file-import"></i>导入 ZIP / JSON</button>
-          <input type="file" id="ni-import-fi" style="display:none" accept=".zip,.json">
+          <button class="ni-btn ni-btn-p ni-btn-inline" id="ni-export-btn"><i class="ti ti-file-export"></i>导出备份</button>
+          <button class="ni-btn ni-btn-w ni-btn-inline" id="ni-import-btn"><i class="ti ti-file-import"></i>导入备份</button>
+          <input type="file" id="ni-import-fi" style="display:none" accept=".json,application/json">
         </div>
         <div class="ni-import-result" id="ni-import-result" style="display:none"></div>
       </div>

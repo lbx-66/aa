@@ -91,6 +91,7 @@ import {
     parseBatchJudgeResponse,
     parseJudgeResponse,
     scoreIntimacy,
+    sceneSubtypeLabel,
     sceneTypeLabel,
 } from './lib/judge-system.js';
 
@@ -103,6 +104,7 @@ import {
 
 import {
     DEFAULT_ENRICH_TEMPLATES,
+    ENRICH_AI_MAX_CHARS,
     ENRICH_MIN_CHARS,
     buildEnrichContextNotes,
     buildEnrichKeywordsSummary,
@@ -640,12 +642,30 @@ window.niTogglePlugin = niTogglePlugin;
 // ============================================================
 // 数据导入/导出
 // ============================================================
+// 导出脱敏：API 地址与 Key 不写入备份文件（与 README「不含 API 地址和 Key」一致），
+// 其余设置与章节数据完整保留；导入旧版（含 Key 的）备份仍可正常还原。
+const NI_EXPORT_STRIP_PATHS = [
+    ['judgeApi', 'url'], ['judgeApi', 'key'],
+    ['enrichApi', 'url'], ['enrichApi', 'key'],
+];
+function niSanitizeExportedSettings(cfg) {
+    const out = {};
+    Object.keys(cfg).forEach(k => { out[k] = cfg[k]; });
+    for (const [group, field] of NI_EXPORT_STRIP_PATHS) {
+        if (out[group] && typeof out[group] === 'object') {
+            out[group] = { ...out[group] };
+            delete out[group][field];
+        }
+    }
+    return out;
+}
+
 async function niExportData() {
     const cfg = extension_settings[EXT_NAME] || {};
     const exportObj = {
         _ni_export_version: 4,
         _ni_export_time: new Date().toISOString(),
-        settings: { ...cfg },
+        settings: niSanitizeExportedSettings(cfg),
         runtime: {
             _enrichChapters: Array.isArray(S.enrichChapters) ? S.enrichChapters : [],
             _enrichFileMeta: S.enrichFileMeta || null,
@@ -657,7 +677,7 @@ async function niExportData() {
     a.download = `novel-injector-backup-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
-    toastr?.success('数据已导出');
+    toastr?.success('数据已导出（判定/加料 API 地址与 Key 不包含在备份中，导入后需重新填写）');
 }
 
 async function niImportData(file) {
@@ -679,6 +699,13 @@ async function niImportData(file) {
         niLoadSettings();
         niEnrichRenderList();
         niEnrichRenderHistory();
+        // 立即把导入的章节落盘为新 key 的服务端文件：否则重启时 niEnrichTryRestore
+        // 仍按旧的 _enrichFileKey 恢复上一本书，导入的数据会丢
+        if (Array.isArray(S.enrichChapters) && S.enrichChapters.length) {
+            const oldFileKey = extension_settings[EXT_NAME]?._enrichFileKey;
+            const savedOk = await niEnrichSaveChapters();
+            if (savedOk) niRemoveOldChaptersFile(oldFileKey);
+        }
         toastr?.success('数据已导入');
     } catch (e) {
         toastr?.error(`导入失败：${e?.message || e}`);
@@ -828,13 +855,13 @@ function niJudgeRenderList() {
     )).join('');
 }
 
-/** 加料页：显示需要加料的章节，按状态区分 已加料 / 加料中 / 未加料 / 失败。 */
+/** 加料页：显示需要加料的章节，按状态区分 已加料 / 加料中 / 未加料 / 失败 / 已跳过。 */
 function niEnrichPageRenderList() {
     const list = q('#ni-e-chapters');
     if (!list) return;
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const rows = [];
-    let enriched = 0, enriching = 0, pending = 0, failed = 0;
+    let enriched = 0, enriching = 0, pending = 0, failed = 0, skipped = 0;
     for (const ch of chapters) {
         if (!ch || ch.filtered) continue;
         const st = ch.status;
@@ -842,6 +869,10 @@ function niEnrichPageRenderList() {
         if (st === CHAPTER_STATUS.ENRICHING) {
             badge = `<span class="ni-e-stat ni-es-r">加料中</span>`;
             enriching++;
+        } else if (st === CHAPTER_STATUS.SKIPPED) {
+            // 跳过 = 持久排除（不再自动拾取），仍显示便于行内「加」/重判解除
+            badge = `<span class="ni-e-stat ni-es-s" title="已跳过：批量加料不再自动处理本章；可点行内「加」或重判后重新纳入">已跳过</span>`;
+            skipped++;
         } else if (st === CHAPTER_STATUS.FAILED) {
             badge = `<span class="ni-e-stat ni-es-e">失败</span>`;
             failed++;
@@ -851,7 +882,7 @@ function niEnrichPageRenderList() {
         } else if (ch.enrich || st === CHAPTER_STATUS.ENRICHED) {
             badge = `<span class="ni-e-stat ni-es-d">已加料</span>`;
             enriched++;
-        } else if (canEnrichChapter(ch) && st !== CHAPTER_STATUS.SKIPPED) {
+        } else if (canEnrichChapter(ch)) {
             badge = `<span class="ni-e-stat ni-es-w" title="已判定可加料，尚未生成">未加料</span>`;
             pending++;
         } else {
@@ -861,9 +892,9 @@ function niEnrichPageRenderList() {
     }
     const cap = q('#ni-e-chapters-cap');
     if (cap) {
-        const total = enriched + enriching + pending + failed;
+        const total = enriched + enriching + pending + failed + skipped;
         cap.textContent = total
-            ? `共 ${total} 章 · 已加料 ${enriched} · 加料中 ${enriching} · 未加料 ${pending} · 失败 ${failed}`
+            ? `共 ${total} 章 · 已加料 ${enriched} · 加料中 ${enriching} · 未加料 ${pending} · 失败 ${failed} · 已跳过 ${skipped}`
             : '';
     }
     if (!rows.length) {
@@ -931,6 +962,7 @@ function niEnrichSelectInvert() {
 }
 
 function niEnrichMergeSelected() {
+    if (niAnyQueueRunning()) { toastr?.warning('判定/加料队列运行中，请先暂停或等待完成再合并章节'); return; }
     if (!S.enrichSelected?.size) { toastr?.warning('请先勾选要合并的章节'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const indices = [...S.enrichSelected]
@@ -947,6 +979,7 @@ function niEnrichMergeSelected() {
 }
 
 function niEnrichDeleteSelected() {
+    if (niAnyQueueRunning()) { toastr?.warning('判定/加料队列运行中，请先暂停或等待完成再删除章节'); return; }
     if (!S.enrichSelected?.size) { toastr?.warning('请先勾选要删除的章节'); return; }
     if (!confirm(`确定删除选中的 ${S.enrichSelected.size} 个章节？此操作不可撤销。`)) return;
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
@@ -986,6 +1019,13 @@ async function niEnrichDetailGenerate(btn) {
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const ch = chapters.find(c => c.id === _niEnrichDetailId);
     if (!ch || !canEnrichChapter(ch)) { toastr?.warning('本章无加料资格（需判定为「是/存疑」或标记「通过」）'); return; }
+    // 该章正在被加料队列处理时禁止详情并发生成（两个流会互相覆盖结果并双倍消耗额度）
+    if (ch.status === CHAPTER_STATUS.ENRICHING && niEnrichQueue?.isRunning?.()) {
+        toastr?.warning('该章正在加料队列中处理，请先暂停队列或等待完成');
+        return;
+    }
+    // 若上一章会话的流式生成还挂着（关闭弹窗未停止），先中止再开始
+    if (_niEnrichDetailController) _niEnrichDetailController.abort();
     const stopBtn = q('#ni-e-detail-enrich-stop');
     const ta = q('#ni-e-detail-enrich');
     const stateEl = q('#ni-e-detail-enrich-state');
@@ -1033,6 +1073,11 @@ async function niEnrichDetailGenerate(btn) {
 function niEnrichOpenDetail(id) {
     const ch = (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).find(c => c.id === id);
     if (!ch) return;
+    // 关闭/切换章节前中止上一章可能仍在跑的流式生成（防止旧流写错章节/污染新会话）
+    if (_niEnrichDetailController) {
+        _niEnrichDetailController.abort();
+        _niEnrichDetailController = null;
+    }
     _niEnrichDetailId = id;
     const titleEl = q('#ni-e-detail-title');
     if (titleEl) titleEl.textContent = `章节 ${ch.index}：${ch.title}`;
@@ -1047,14 +1092,17 @@ function niEnrichOpenDetail(id) {
         judgeRow.querySelectorAll('input').forEach(inp => { inp.checked = false; });
         const cur = ch.judge?.result;
         const target = cur && judgeRow.querySelector(`input[value="${cur}"]`);
-        (target || judgeRow.querySelector('input[value=""]'))?.setAttribute('checked', '');
+        // 必须用属性态 checked=true（setAttribute('checked') 只改 defaultChecked，
+        // 不改变已插入 radio 的选中态，会导致回显失效并在保存时误清字段）
+        const pick = (target || judgeRow.querySelector('input[value=""]'));
+        if (pick) pick.checked = true;
     }
-    // 人工标记单选
+    // 人工标记单选（默认「无」）
     const flagRow = q('#ni-e-detail-flag-row');
     if (flagRow) {
         flagRow.querySelectorAll('input').forEach(inp => { inp.checked = false; });
         const target = flagRow.querySelector(`input[value="${ch.flag || ''}"]`);
-        if (target) target.setAttribute('checked', '');
+        if (target) target.checked = true;
     }
     // 判定信息展示（含失败原因）
     const evEl = q('#ni-e-detail-evidence');
@@ -1069,7 +1117,24 @@ function niEnrichOpenDetail(id) {
                 ? '\n安全否决：该章不可自动加料。可在下方人工标记后手动处理。'
                 : '';
             const sceneTypeText = ch.judge.sceneType ? ` · 场景类型：${sceneTypeLabel(ch.judge.sceneType)}` : '';
-            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)}${sceneTypeText} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}`;
+            const subtypeText = (ch.judge.sceneType && ch.judge.sceneSubtype && ch.judge.sceneSubtype !== 'unclear')
+                ? ` · 子类型：${sceneSubtypeLabel(ch.judge.sceneSubtype)}` : '';
+            // 附加信息：AI 加料建议 / 跨章归位说明 / 承接排除说明
+            let extraNote = '';
+            if (Array.isArray(ch.judge.enrichHints) && ch.judge.enrichHints.length) {
+                extraNote += `\n加料建议（判定时给出）：\n${ch.judge.enrichHints.map((h, i) => `${i + 1}. ${h}`).join('\n')}`;
+            }
+            if (ch.judge.promoNote) extraNote += `\n跨章补全说明：${ch.judge.promoNote}`;
+            if (ch.judge.gapInPrev && !ch.judge.seamResolved) {
+                extraNote += '\n（跨章提示：本场景的补全应归上一章章末——若上一章已判定且章末有铺垫，系统已自动提升；可对该章「重判」刷新）';
+            }
+            if (ch.judge.seamToPrev) {
+                extraNote += `\n（已跨章归位：本场景的补全已记到上一章《${String(ch.judge.seamToPrev.title || '').trim() || ch.judge.seamToPrev.index}》章末，本章不再加料）`;
+            }
+            if (ch.judge.carryover?.suppressed) {
+                extraNote += `\n（关键词引擎已排除 ${ch.judge.carryover.suppressed} 处承接上一章场景的窗口${ch.judge.carryover.carryoverOnly ? '，本章按承接处理' : ''}）`;
+            }
+            evEl.textContent = `当前判定：${judgeResultLabel(ch.judge.result)}${sceneTypeText}${subtypeText} · 置信度 ${ch.judge.confidence ?? '-'}（${modeText}）\n依据：${ch.judge.evidence || '—'}${vetoHint}${extraNote}`;
         } else if (ch.error) {
             evEl.style.display = '';
             evEl.textContent = `上次处理失败：${ch.error}\n可在列表中点「重判」或工具栏「重判失败」重试（AI 返回被截断时会自动放大输出上限重试）。`;
@@ -1093,6 +1158,11 @@ function niEnrichOpenDetail(id) {
 }
 
 function niEnrichCloseDetail() {
+    // 关闭弹窗即中止未完成的流式生成（状态由 enrichChapter 的 abort 分支回退）
+    if (_niEnrichDetailController) {
+        _niEnrichDetailController.abort();
+        _niEnrichDetailController = null;
+    }
     q('#ni-e-detail-modal').style.display = 'none';
     _niEnrichDetailId = null;
 }
@@ -1111,10 +1181,19 @@ function niEnrichMarkManual(ch) {
 }
 
 function niEnrichSaveDetail() {
+    // 保存时中止仍在跑的流式生成，避免生成完成回调覆盖手动编辑结果
+    if (_niEnrichDetailController) {
+        _niEnrichDetailController.abort();
+        _niEnrichDetailController = null;
+    }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const idx = chapters.findIndex(c => c.id === _niEnrichDetailId);
     const ch = chapters[idx];
-    if (!ch) { niEnrichCloseDetail(); return; }
+    if (!ch) {
+        toastr?.warning('章节已不存在，保存已取消');
+        niEnrichCloseDetail();
+        return;
+    }
     const title = String(q('#ni-e-detail-title-inp')?.value || '').trim();
     const text = String(q('#ni-e-detail-text')?.value || '');
     if (title && title !== ch.title) ch.title = title;
@@ -1125,6 +1204,7 @@ function niEnrichSaveDetail() {
         ch.status = CHAPTER_STATUS.UNDETECTED;
         ch.judge = null;
         ch.enrich = null;
+        ch.error = '';
         ch.flag = '';
     }
     // 判定结果（手动修改，选中「保持」则不动）
@@ -1132,10 +1212,10 @@ function niEnrichSaveDetail() {
     if (judgeChecked !== undefined && judgeChecked !== '') {
         const cur = ch.judge?.result;
         if (cur !== judgeChecked) {
+            // 人工改判 = 用户意图最高优先：清掉可能冲突的自动分类/建议，恢复按 result 判定
             ch.judge = {
-                ...(ch.judge || {}),
                 result: judgeChecked,
-                confidence: ch.judge?.confidence ?? 0,
+                confidence: judgeChecked === 'doubt' ? 0.5 : (ch.judge?.confidence ?? 0.8),
                 evidence: ch.judge?.evidence || '手动标记',
                 mode: 'manual',
                 at: Date.now(),
@@ -1152,15 +1232,30 @@ function niEnrichSaveDetail() {
     const enrichTa = q('#ni-e-detail-enrich');
     if (enrichTa) {
         const enrichText = enrichTa.value;
-        if (enrichText && enrichText !== (ch.enrich?.text || '')) {
-            ch.enrich = {
-                ...(ch.enrich || {}),
-                text: enrichText,
-                at: Date.now(),
-                reviewed: ch.enrich?.reviewed !== false,
-                manual: true,
-            };
-            niEnrichMarkManual(ch);
+        const oldEnrichText = ch.enrich?.text || '';
+        if (enrichText !== oldEnrichText) {
+            if (enrichText) {
+                const oldChars = Number(ch.enrich?.charCount) || 0;
+                const delta = enrichText.length - oldEnrichText.length;
+                const oldSegments = Array.isArray(ch.enrich?.segments) ? ch.enrich.segments : [];
+                ch.enrich = {
+                    ...(ch.enrich || {}),
+                    text: enrichText,
+                    at: Date.now(),
+                    reviewed: ch.enrich?.reviewed !== false,
+                    manual: true,
+                    // 手动编辑后重算加料字数（diff 近似），详情/列表字数不再停留在 AI 旧值
+                    charCount: Math.max(0, oldChars + delta),
+                    segments: oldSegments,
+                    merge: oldSegments.length ? (ch.enrich?.merge || 'manual') : 'manual',
+                };
+                niEnrichMarkManual(ch);
+            } else if (ch.enrich) {
+                // 清空加料文本框 = 删除加料结果，回到已判定状态
+                ch.enrich = { noContent: true, at: Date.now() };
+                if (!transitionChapter(ch, CHAPTER_STATUS.JUDGED)) ch.status = CHAPTER_STATUS.JUDGED;
+                toastr?.info('加料结果已清空（保留原文）');
+            }
         }
     }
     niEnrichCloseDetail();
@@ -1170,14 +1265,22 @@ function niEnrichSaveDetail() {
 }
 
 function niEnrichSplitDetail() {
+    if (niAnyQueueRunning()) { toastr?.warning('判定/加料队列运行中，请先暂停或等待完成再拆分章节'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     const idx = chapters.findIndex(c => c.id === _niEnrichDetailId);
     const ch = chapters[idx];
     if (!ch) return;
     const ta = q('#ni-e-detail-text');
+    // 正文在编辑器里被改过但未保存时禁止拆分：切分位置按原文计算会错位，且未保存修改会丢失
+    if (ta && ta.value !== ch.text) {
+        toastr?.warning('请先点「保存」保存正文修改，再进行拆分');
+        return;
+    }
     const at = ta && ta.selectionStart != null ? ta.selectionStart : Math.floor(ch.text.length / 2);
     if (splitChapter(chapters, idx, at)) {
         niEnrichCloseDetail();
+        // 拆分重排了全部章节 id/序号，导入报告的 filtered 行随之失效，需同步重建
+        S.enrichReport = buildChapterImportReport(chapters, niEnrichCfg().threshold);
         niEnrichRenderList();
         toastr?.success('章节已拆分');
         niEnrichScheduleSave();
@@ -1232,7 +1335,12 @@ function niEnrichRestoreFiltered() {
     (Array.isArray(S.enrichChapters) ? S.enrichChapters : []).forEach(ch => {
         if (set.has(ch.id)) {
             ch.filtered = false;
-            ch.status = CHAPTER_STATUS.UNDETECTED;
+            // 携带旧判定/加料结果的章按数据恢复合法状态（避免 UNDETECTED+judge 并存导致
+            // 列表显示「判」、统计计"待判定"、下次判定覆盖原结果）
+            if (ch.enrich?.noContent) ch.status = CHAPTER_STATUS.JUDGED;
+            else if (ch.enrich) ch.status = ch.enrich.manual ? CHAPTER_STATUS.MODIFIED : CHAPTER_STATUS.ENRICHED;
+            else if (ch.judge) ch.status = CHAPTER_STATUS.JUDGED;
+            else ch.status = CHAPTER_STATUS.UNDETECTED;
         }
     });
     S.enrichReport = buildChapterImportReport(S.enrichChapters, niEnrichCfg().threshold);
@@ -1246,6 +1354,11 @@ function niEnrichRestoreFiltered() {
 async function niEnrichApplyFile(file) {
     const reader = new FileReader();
     reader.onload = async ev => {
+        // 已有判定/加料进度时防误覆盖（仅导入过纯文本、无任何处理结果时不打扰）
+        if (Array.isArray(S.enrichChapters) && S.enrichChapters.length
+            && S.enrichChapters.some(ch => ch && (ch.judge || ch.enrich || ch.flag || (ch.status && ch.status !== CHAPTER_STATUS.UNDETECTED)))) {
+            if (!confirm(`导入新文件将替换当前 ${S.enrichChapters.length} 章及已有判定/加料结果，确定继续？`)) return;
+        }
         try {
             const buf = ev.target.result;
             const fingerprint = await niFingerprintArrayBuffer(buf);
@@ -1255,7 +1368,7 @@ async function niEnrichApplyFile(file) {
             let text;
             let boundaries = null;
             if (ext === '.epub') {
-                const epub = niExtractEpubText(buf);
+                const epub = await niExtractEpubText(buf);
                 text = epub.text;
                 boundaries = epub.boundaries;
             } else {
@@ -1305,7 +1418,11 @@ async function niEnrichApplyFile(file) {
             // 导出默认书名 = 导入文件名
             const expTitleEl = q('#ni-e-exp-title');
             if (expTitleEl) expTitleEl.value = file.name.replace(/\.(txt|md|markdown|epub)$/i, '');
-            niEnrichScheduleSave({ immediate: true });
+            // 记录旧 key（换书后清理旧服务端文件，避免孤儿文件/原文残留），然后立即落盘新书
+            const oldFileKey = extension_settings[EXT_NAME]?._enrichFileKey;
+            const savedOk = await niEnrichSaveChapters();
+            // 新书落盘成功才删除旧文件（保存失败时保留旧书供恢复兜底）
+            if (savedOk) niRemoveOldChaptersFile(oldFileKey);
         } catch (e) {
             console.error('[NI] 章节导入失败:', e);
             alert(`章节导入失败：${e.message || e}`);
@@ -1344,6 +1461,30 @@ function niSetBatchQueues({ judge = null, enrich = null } = {}) {
 }
 window.niSetBatchQueues = niSetBatchQueues;
 
+/** 判定/加料队列是否任一正在运行（结构编辑等破坏性操作需要先拦截）。 */
+function niAnyQueueRunning() {
+    return !!(niJudgeQueue?.isRunning?.() || niEnrichQueue?.isRunning?.());
+}
+
+/**
+ * 章节在全书中的前/后一个"未过滤"邻居（跨章上下文统一口径）：
+ * filtered（被短章节过滤）的章不参与判定/加料流程，做"上一章/下一章"时应跳过它们。
+ */
+function niKeptNeighbors(ch) {
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
+    const idx = chapters.indexOf(ch);
+    if (idx < 0 || !Array.isArray(chapters)) return { prev: null, next: null };
+    let prev = null;
+    let next = null;
+    for (let i = idx - 1; i >= 0; i--) {
+        if (!chapters[i].filtered) { prev = chapters[i]; break; }
+    }
+    for (let i = idx + 1; i < chapters.length; i++) {
+        if (!chapters[i].filtered) { next = chapters[i]; break; }
+    }
+    return { prev, next };
+}
+
 // —— 章节持久化（服务端重文件 *_chapters.json）——
 let _niEnrichSaveQueue = Promise.resolve();
 let _niEnrichSaveTimer = null;
@@ -1357,13 +1498,37 @@ function niPrepareServerJsonUpload(name, payload) {
     return JSON.stringify({ name, data: niB64(JSON.stringify(payload)) });
 }
 
-async function niServerUploadJson(name, payload) {
+async function niServerUploadJson(bodyString) {
     const res = await fetch('/api/files/upload', {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: niPrepareServerJsonUpload(name, payload),
+        body: bodyString,
+        keepalive: true, // 页面关闭前兜底保存尽量送达
     });
     if (!res.ok) throw new Error(`服务端写入失败: ${res.status}`);
+}
+
+/** 删除服务端文件（换书/换备份时清理旧 key 的章节文件，避免孤儿文件累积与原文残留）。 */
+async function niServerDeleteJson(name) {
+    try {
+        const res = await fetch('/api/files/delete', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ name }),
+        });
+        if (!res.ok && res.status !== 404) {
+            console.warn('[NI] 旧章节文件删除失败:', name, res.status);
+        }
+    } catch (e) {
+        console.warn('[NI] 旧章节文件删除失败:', e?.message || e);
+    }
+}
+
+/** 旧书/旧备份的章节文件清理（key 与当前不同才删；失败仅告警不影响主流程）。 */
+function niRemoveOldChaptersFile(oldKey) {
+    const newKey = niEnrichHeavyFileKey();
+    if (!oldKey || !newKey || oldKey === newKey) return;
+    void niServerDeleteJson(niHeavyPartFileName(oldKey, 'chapters'));
 }
 
 async function niServerLoadJsonByNames(names) {
@@ -1386,6 +1551,9 @@ function niEnrichHeavyFileKey() {
 
 function niEnrichScheduleSave({ immediate = false } = {}) {
     if (!Array.isArray(S.enrichChapters) || !S.enrichChapters.length) return;
+    // 「自动保存」关闭时：跳过逐章进度的防抖落盘（章节数据仅保留在内存，
+    // 队列结束/暂停/导入/关页等关键点仍以 immediate 形式落盘一次）
+    if (!immediate && extension_settings[EXT_NAME]?.autoSaveEnabled === false) return;
     if (_niEnrichSaveTimer) { clearTimeout(_niEnrichSaveTimer); _niEnrichSaveTimer = null; }
     if (immediate) { void niEnrichSaveChapters(); return; }
     _niEnrichSaveTimer = setTimeout(() => {
@@ -1422,9 +1590,10 @@ async function niEnrichSaveChapters() {
         settings._enrichFileKey = fileKey;
         saveSettingsDebounced?.();
     }
-    _niEnrichSaveQueue = _niEnrichSaveQueue.catch(() => {}).then(() =>
-        niServerUploadJson(niHeavyPartFileName(fileKey, 'chapters'), payload),
-    );
+    // 入队前同步冻结上传字节：排队期间 judge/enrich 引用若被原地修改，
+    // 也不会把"晚于保存时刻"的数据混入本次快照
+    const body = niPrepareServerJsonUpload(niHeavyPartFileName(fileKey, 'chapters'), payload);
+    _niEnrichSaveQueue = _niEnrichSaveQueue.catch(() => {}).then(() => niServerUploadJson(body));
     try {
         await _niEnrichSaveQueue;
         return true;
@@ -1501,13 +1670,13 @@ function niEnrichOnKeyDown(e) {
     const runningJudge = niJudgeQueue?.isRunning?.();
     const runningEnrich = niEnrichQueue?.isRunning?.();
     const queueRunning = runningJudge || runningEnrich;
+    // 所有快捷键都只在插件抽屉打开时生效（避免聊天页/主界面误触）
+    const drawerOpen = !!document.querySelector('#ni_drawer_content.openDrawer');
+    if (!drawerOpen) return;
 
     if ((e.ctrlKey || e.metaKey) && (e.key === 'i' || e.key === 'I')) {
-        const drawerOpen = !!document.querySelector('#ni_drawer_content.openDrawer');
-        if (drawerOpen) {
-            e.preventDefault();
-            q('#ni-e-fi')?.click();
-        }
+        e.preventDefault();
+        q('#ni-e-fi')?.click();
         return;
     }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'e' || e.key === 'E')) {
@@ -1515,14 +1684,21 @@ function niEnrichOnKeyDown(e) {
         niEnrichExport();
         return;
     }
-    if (!queueRunning) return;
 
     if (e.code === 'Space') {
         e.preventDefault();
+        // 空格 = 开始/继续/暂停切换：运行中 → 暂停；空闲/暂停态 → 继续（重新收集未完成项）。
+        // 判定与加料队列互不阻塞，空闲时可同时继续各自未完成的任务
         if (runningJudge) niJudgeQueue.pause();
         else if (runningEnrich) niEnrichQueue.pause();
-        else (niJudgeQueue || niEnrichQueue)?.run?.();
-    } else if (e.key === 's' || e.key === 'S') {
+        else {
+            if (niJudgeQueue) void niJudgeQueue.run();
+            if (niEnrichQueue) void niEnrichQueue.run();
+        }
+        return;
+    }
+    if (!queueRunning) return;
+    if (e.key === 's' || e.key === 'S') {
         e.preventDefault();
         (runningJudge ? niJudgeQueue : niEnrichQueue)?.skipCurrent?.();
     } else if (e.key === 'Escape') {
@@ -1645,13 +1821,14 @@ function niGetAutoNames() {
     return _niAutoNamesCache;
 }
 
-/** 关键词模式场景评分（带全书画像/配置/自动名单上下文）。 */
-function niScoreChapter(ch) {
+/** 关键词模式场景评分（带全书画像/配置/自动名单上下文；可选上一章评分用于跨章承接降级）。 */
+function niScoreChapter(ch, { prevScored = null } = {}) {
     return scoreIntimacy(ch?.text || '', niJudgeRules(), {
         sceneConfig: niSceneConfig(),
         bookProfile: niGetBookProfile().profile,
         chapterNumber: ch?.index || 0,
         autoNames: niGetAutoNames(),
+        prevScored: prevScored || undefined,
     });
 }
 
@@ -1672,24 +1849,107 @@ function niChapterSummary(ch) {
     return title ? `《${title}》${summary}` : summary;
 }
 
-/** 构建判定上下文链：前后章摘要（用于 AI 判定参考）。 */
+/** 章节开头片段（默认 220 字；用于判断本章结尾是否会被下一章承接）。 */
+function niChapterHead(ch, len = 220) {
+    if (!ch || !ch.text) return '';
+    const text = String(ch.text).replace(/\s+/g, ' ').trim();
+    if (text.length <= len) return text;
+    return text.slice(0, len) + '…';
+}
+
+/** 章节结尾片段（默认 320 字；用于查清上一章性爱是否已发生/止于铺垫）。 */
+function niChapterTail(ch, len = 320) {
+    if (!ch || !ch.text) return '';
+    const text = String(ch.text).replace(/\s+/g, ' ').trim();
+    if (text.length <= len) return text;
+    return '…' + text.slice(-len);
+}
+
+/** 前章判定摘要（供跨章承接判断；无判定返回 ''）。 */
+function niChapterJudgeLine(ch) {
+    if (!ch?.judge?.result) return '';
+    const label = judgeResultLabel(ch.judge.result);
+    const type = ch.judge.sceneType ? `，场景类型：${sceneTypeLabel(ch.judge.sceneType) || ch.judge.sceneType}` : '';
+    return `${label}${type}（置信度 ${ch.judge.confidence ?? '-'}）`;
+}
+
+/** 构建判定上下文链（用于 AI 判定参考）：
+ *  前章摘要/前章判定/前章结尾片段（查跨章承接）+ 后章开头片段（查本章结尾是否被承接）。
+ *  相邻章按「未过滤章节」取（filtered 短章不入流程，跳过）。 */
 function niBuildContextChain(ch) {
-    const chapters = S.enrichChapters;
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
     if (!ch || !Array.isArray(chapters)) return '';
-    const idx = chapters.indexOf(ch);
-    if (idx < 0) return '';
-    const prev = idx > 0 ? chapters[idx - 1] : null;
-    const next = idx < chapters.length - 1 ? chapters[idx + 1] : null;
+    if (chapters.indexOf(ch) < 0) return '';
+    const { prev, next } = niKeptNeighbors(ch);
     const parts = [];
     if (prev) {
         const s = niChapterSummary(prev);
-        if (s) parts.push(`前章：${s}`);
+        if (s) parts.push(`前章摘要：${s}`);
+        const j = niChapterJudgeLine(prev);
+        if (j) parts.push(`前章判定：${j}`);
+        const t = niChapterTail(prev, 320);
+        if (t) parts.push(`前章结尾片段：${t}`);
     }
     if (next) {
-        const s = niChapterSummary(next);
-        if (s) parts.push(`后章：${s}`);
+        const h = niChapterHead(next, 220);
+        if (h) parts.push(`后章开头片段：${h}`);
     }
     return parts.length ? parts.join('\n') : '（无相邻章节信息）';
+}
+
+/** 跨章归位用的"上一章末尾铺垫"信号词（宁缺毋滥：命中才允许把缺口回指到上一章章末）。 */
+const NI_SEAM_SCAFFOLD_MARKS = [
+    '独处', '关上门', '关灯', '熄灯', '灭烛', '吹灭', '吹灯', '烛火',
+    '褪去', '褪下', '解开衣', '衣襟', '衣衫', '罗衫', '上床', '同榻',
+    '榻上', '床榻', '床笫', '卧室', '内室', '闺房', '香闺', '吻住',
+    '深吻', '亲吻', '抚摸', '爱抚', '搂住', '搂在', '相拥', '拥入',
+    '缠绵', '暧昧', '情动', '动情', '温存', '留宿', '今夜留下来',
+    '别走', '陪陪我', '软在', '燥热', '情热', '气息乱了', '意乱情迷',
+];
+
+/** 上一章末尾是否留有可承接的铺垫（约末尾 420 字内命中信号词）。 */
+function niChapterTailHasSeamScaffold(ch) {
+    if (!ch?.text) return false;
+    const tail = String(ch.text).slice(-420);
+    return NI_SEAM_SCAFFOLD_MARKS.some(m => tail.includes(m));
+}
+
+/**
+ * 跨章承接归位（判定落库后调用，幂等）：
+ * AI 判定标了 gapInPrev（性爱被省略在两章之间，缺口应补在上一章章末）时，
+ * 若上一章已判定但无加料资格，且其章末留有铺垫信号 → 提升上一章为 explicit_sex
+ * （可加料），并写入 promoNote（章末补全说明）；否则宁缺毋滥不动。
+ */
+function niReconcileCrossChapter() {
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters.filter(c => c && !c.filtered) : [];
+    for (let i = 1; i < chapters.length; i++) {
+        const cur = chapters[i];
+        const curJudge = cur?.judge;
+        if (!curJudge?.gapInPrev || curJudge.seamResolved) continue;
+        const prev = chapters[i - 1];
+        const prevJudge = prev?.judge;
+        if (!prevJudge || prev.status !== CHAPTER_STATUS.JUDGED) continue; // 上一章未判定/处理中不动
+        if (prev.flag === 'fail') { curJudge.seamResolved = true; continue; } // 用户否决过
+        if (prev.enrich) { curJudge.seamResolved = true; continue; }          // 已有人工/旧结果
+        if (canEnrichChapter(prev)) { curJudge.seamResolved = true; continue; } // 已可加料
+        if (!niChapterTailHasSeamScaffold(prev)) continue; // 章末无可承接铺垫：宁缺毋滥
+        // —— 提升上一章：缺口归其章末 ——
+        prevJudge.result = 'yes';
+        prevJudge.sceneType = 'explicit_sex';
+        prevJudge.sceneSubtype = prevJudge.sceneSubtype || curJudge.sceneSubtype;
+        prevJudge.confidence = Math.max(Number(prevJudge.confidence) || 0, 0.6);
+        prevJudge.at = Date.now();
+        if (!Array.isArray(prevJudge.enrichHints) || !prevJudge.enrichHints.length) {
+            prevJudge.enrichHints = ['在章末铺垫收束处自然展开当晚被省略的亲密场景，使其与下一章开头的次日/事后描写衔接；不要把场景写成回忆或闪回。'];
+        }
+        prevJudge.promoNote = `跨章归位：下一章《${String(cur.title || '').trim() || cur.index}》开头承接本场景（两章间省略的性爱缺口归本章章末补全）。请在原文铺垫自然收束处把当晚场景补全，与下一章开头衔接；不要写成回忆或闪回，不要改变本章既有情节走向。`;
+        prevJudge.promoFrom = cur.title ? `${cur.index}《${cur.title}》` : String(cur.index || '下一章');
+        delete prevJudge.gapInPrev;
+        curJudge.seamResolved = true;
+        curJudge.seamToPrev = { index: prev.index, title: prev.title || '' };
+        console.log(`[NI] 跨章归位：第 ${prev.index} 章「${prev.title || ''}」提升为章末补全（承接自第 ${cur.index} 章「${cur.title || ''}」的次日/事后描写）`);
+        niEnrichScheduleSave();
+    }
 }
 
 /** 识别「模型内容安全拦截」错误（Google Gemini 等对含敏感词的提示词直接 400 拒绝）。 */
@@ -1738,7 +1998,24 @@ async function niJudgeCallRetry(messages, api, signal, { baseLength = 800 } = {}
     }
 }
 
-/** AI 深度判定单个章节（含截断放大重试）；供纯 AI 模式与混合模式的精判阶段使用。
+/** 本章在全书数组中的前一个未过滤章节的评分（供关键词引擎跨章承接降级；无则 null）。 */
+function niPrevScoredFor(ch, index) {
+    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
+    if (!ch) return null;
+    const idx = (typeof index === 'number' && index >= 0 && chapters[index] === ch)
+        ? index
+        : chapters.indexOf(ch);
+    const prev = niKeptNeighbors(chapters[idx] || ch).prev;
+    if (!prev || !prev.text) return null;
+    try {
+        return niScoreChapter(prev);
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * AI 深度判定单个章节（含截断放大重试）；供纯 AI 模式与混合模式的精判阶段使用。
  *  opts.sceneHint：关键词初筛的场景窗口明细（混合模式自动精判时传入，此时 ch.judge 尚未落库）；
  *  精判阶段（ch.judge 已有初筛结果）自动读取 ch.judge.scenes。
  */
@@ -1752,14 +2029,14 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
         ? opts.sceneHint
         : (Array.isArray(ch?.judge?.scenes) ? ch.judge.scenes : []);
     if (scenes.length) {
-        rulesSummary += `\n【关键词初筛的场景窗口分析（仅供参考，可核实或反驳）】\n${buildScenesText(scenes)}\n注意：初筛窗口只表示该区域命中了场景词，可能包含误报（如普通亲吻/拥抱/暧昧氛围、比喻用语、农田/战场等字面义隐喻词）。请按上方判定标准独立判断：只有确认为性爱情节且存在缺口才算「是」，普通亲密/纯爱互动一律「无缺口」。`;
+        rulesSummary += `\n【关键词初筛的场景窗口分析（仅供参考，可核实或反驳）】\n${buildScenesText(scenes)}\n注意：初筛窗口只表示该区域命中了场景词，可能包含误报（如普通亲吻/拥抱/暧昧氛围、比喻用语、农田/战场等字面义隐喻词）。请按上方判定标准独立判断：只要确认存在性爱情节即判 scene_type 为 "explicit_sex"、has_gap: true（无论现有描写简略还是已完整，都可加料丰富；置信度按简略程度分档），普通亲密/纯爱互动/暧昧张力一律不是性爱情节。`;
     }
     // 本章情报（人物卡/前史卡）：让 AI 判定时掌握人物关系与剧情前史（如夫妻/恋人/敌对状态）
     const judgeNotes = niChapterContextNotes(ch);
     if (judgeNotes) {
         rulesSummary += `\n【本章人物与前史情报】\n${judgeNotes}`;
     }
-    // 上下文链：前后章摘要，帮助 AI 判断叙事弧位置
+    // 上下文链：前章摘要/判定/结尾片段 + 后章开头片段，帮助 AI 判断跨章承接与缺口归属
     const contextChain = niBuildContextChain(ch);
     const messages = buildJudgeMessages(template, {
         chapterContent: ch.text,
@@ -1775,6 +2052,9 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
         evidence: parsed.evidence,
         mode: 'ai',
         sceneType: parsed.sceneType || null,
+        sceneSubtype: parsed.sceneSubtype,
+        enrichHints: Array.isArray(parsed.enrichHints) ? parsed.enrichHints : [],
+        gapInPrev: parsed.gapInPrev === true,
         scenes: scenes.slice(), // 附带初筛场景窗口明细（详情/后续加料参考）
         at: Date.now(),
     };
@@ -1803,16 +2083,38 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
     for (const ch of list) scoredByIndex.set(ch.index, niScoreChapter(ch));
 
     const template = extension_settings[EXT_NAME]?.judgePrompts?.batchTemplate || BATCH_JUDGE_PROMPT;
-    // 批量材料每章附带本章情报（人物卡/前史卡）+ 上下文链（前后章摘要），AI 判定时掌握人物关系与叙事弧位置
+    // 批量材料每章附带本章情报（人物卡/前史卡）+ 上下文链（前章摘要/前章判定/前章尾段 + 后章摘要），
+    // 让 AI 判定时掌握人物关系、叙事弧位置与跨章承接（上一章性爱是否已发生/止于铺垫）。
+    // 成本控制：前章尾段（240 字）只给「疑似承接章」附——上一章已判性爱，或本章含事后/省略类
+    // 非核心窗口需要核实前章；普通章节仅带前章摘要/判定行（前章判定行很便宜但信息量最大）。
     const listWithCtx = list.map(ch => {
         const item = { ...ch, contextNotes: niChapterContextNotes(ch) };
-        // 上下文链：从全书章节列表中查找前后章
-        if (Array.isArray(S.enrichChapters)) {
-            const idx = S.enrichChapters.indexOf(ch);
-            if (idx >= 0) {
-                if (idx > 0) item.prevSummary = niChapterSummary(S.enrichChapters[idx - 1]);
-                if (idx < S.enrichChapters.length - 1) item.nextSummary = niChapterSummary(S.enrichChapters[idx + 1]);
+        // 上下文链：取全书中本章前/后最近的未过滤章节（filtered 短章不入流程，跳过）
+        const { prev, next } = niKeptNeighbors(ch);
+        if (prev) {
+            const s = niChapterSummary(prev);
+            if (s) item.prevSummary = s;
+            const jl = niChapterJudgeLine(prev);
+            if (jl) item.prevJudge = jl;
+            // 疑似承接章才附前章尾段（判定行/摘要始终保留）
+            const prevExplicit = prev?.judge?.sceneType === 'explicit_sex' || prev?.judge?.result === 'yes';
+            const scored = scoredByIndex.get(ch.index);
+            const hasCarryoverCandidate = Array.isArray(scored?.scenes)
+                && scored.scenes.some(w => {
+                    const coreHits = ((w?.stages?.oral || []).length + (w?.stages?.penetration || []).length) > 0;
+                    if (coreHits) return false; // 本章有自有核心场景，正常按新场景判
+                    const dec = w?.decision;
+                    return dec === 'insert_full_scene' || dec === 'insert_before_aftermath'
+                        || (w?.stages?.aftermath || []).length > 0;
+                });
+            if (prevExplicit || hasCarryoverCandidate) {
+                const tl = niChapterTail(prev, 240);
+                if (tl) item.prevTail = tl;
             }
+        }
+        if (next) {
+            const ns = niChapterSummary(next);
+            if (ns) item.nextSummary = ns;
         }
         return item;
     });
@@ -1836,7 +2138,7 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
         console.warn('[NI] 批量判定 JSON 解析失败，追加格式纠正重试:', parseErr?.message || parseErr);
         const retryMessages = [...messages, {
             role: 'user',
-            content: `【格式纠正要求（必须遵守）】\n上一次输出不是有效的 JSON（原因：${parseErr?.message || parseErr}）。请重新输出：只输出一个 JSON 对象 {"chapters": [{"index": 编号, "scene_type": "explicit_sex或romantic_tension或romance或neutral或violence", "has_gap": true或false, "confidence": 0到1的小数, "evidence": "..."}]}，不要输出任何解释、Markdown 代码围栏或其他文字；chapters 必须覆盖全部 ${list.length} 章，index 与材料章节编号一致。`,
+            content: `【格式纠正要求（必须遵守）】\n上一次输出不是有效的 JSON（原因：${parseErr?.message || parseErr}）。请重新输出：只输出一个 JSON 对象 {"chapters": [{"index": 编号, "scene_type": "explicit_sex或romantic_tension或romance或neutral或violence", "has_gap": true或false, "confidence": 0到1的小数, "evidence": "..."}]}，不要输出任何解释、Markdown 代码围栏或其他文字；chapters 必须覆盖全部 ${list.length} 章，index 与材料章节编号一致。可选字段（按补充规则）："enrich_hints": ["补全建议"]、"scene_subtype": "intercourse或oral或solo或mutual或unclear"、"gap_in_prev_chapter": true（两章间省略时）。`,
         }];
         const raw2 = await niJudgeCallRetry(retryMessages, api, signal, { baseLength: 8000 });
         byIndex = parseBatchJudgeResponse(raw2); // 仍失败则抛出（错误信息已附原始响应片段）
@@ -1866,6 +2168,9 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
             evidence: res.evidence || scored.evidence,
             mode: 'batch',
             sceneType: res.sceneType || null,
+            sceneSubtype: res.sceneSubtype,
+            enrichHints: Array.isArray(res.enrichHints) ? res.enrichHints : [],
+            gapInPrev: res.gapInPrev === true,
             scenes: scored.scenes,
             safety: scored.safety,
             bookProfile: scored.bookProfile,
@@ -1877,6 +2182,8 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
         delete ch.error;
         transitionChapter(ch, CHAPTER_STATUS.JUDGED);
     }
+    // 跨章承接归位：本组标了 gapInPrev（两章间省略）的章 → 提升其上一章为章末补全（幂等）
+    niReconcileCrossChapter();
     niEnrichScheduleSave();
 }
 
@@ -1897,6 +2204,8 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
         const rules = niJudgeRules();
         const refinePass = forceAi || _niJudgeRefinePass === true;
         const keywordOnly = _niJudgeKeywordPass === true;
+        // 关键词引擎评分共享的上一章评分（跨章承接降级用；AI 精判不需要，上下文链已覆盖）
+        const prevScored = refinePass ? null : niPrevScoredFor(ch, index);
         let judge = null;
         if (refinePass) {
             // 精判阶段：直接 AI，覆盖之前的可疑标记与关键词结果
@@ -1904,17 +2213,17 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
         } else if (keywordOnly) {
             // 关键词初筛（场景引擎）：四分类（有可补全窗口→是、仅场景无缺口→可疑、
             // 无场景→否、安全否决→安全否决），可疑章节带 hybridPending 标记，供「AI 精判可疑」收集
-            const scored = niScoreChapter(ch);
+            const scored = niScoreChapter(ch, { prevScored });
             const cls = classifyKeywordResult(scored);
             judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
         } else if (rules.mode === 'keyword') {
             // 纯关键词模式（场景引擎）：直接 是/否/安全否决 判定，不产生可疑标记
-            judge = keywordJudgeToStore(niScoreChapter(ch));
+            judge = keywordJudgeToStore(niScoreChapter(ch, { prevScored }));
         } else if (rules.mode === 'hybrid' || rules.mode === 'hybrid_all') {
             // 关键词 + AI 组合：先关键词初筛；
             //  - hybrid：仅可疑章节自动级联 AI 精判（"开始判定"全自动两阶段，推荐）
             //  - hybrid_all：初筛后全部章节 AI 精判（覆盖初筛结果）
-            const scored = niScoreChapter(ch);
+            const scored = niScoreChapter(ch, { prevScored });
             const cls = classifyKeywordResult(scored);
             judge = { ...keywordJudgeToStore(scored), result: cls.result, hybridPending: cls.hybridPending };
             if (rules.mode === 'hybrid_all' || judge.hybridPending) {
@@ -1927,6 +2236,8 @@ async function judgeChapter(ch, index, { signal = null, forceAi = false } = {}) 
         ch.judge = judge;
         delete ch.error;
         transitionChapter(ch, CHAPTER_STATUS.JUDGED);
+        // 跨章承接归位：gapInPrev（两章间省略）→ 提升上一章为章末补全（幂等）
+        niReconcileCrossChapter();
         niEnrichScheduleSave();
         return judge;
     } catch (err) {
@@ -1948,7 +2259,9 @@ let _niJudgeKeywordPass = false;
 function niJudgeQueueEligible(ch) {
     if (!ch || ch.filtered) return false;
     if (_niJudgeRefinePass) return !!ch.judge?.hybridPending;
-    return [CHAPTER_STATUS.UNDETECTED, CHAPTER_STATUS.FAILED, CHAPTER_STATUS.SKIPPED].includes(ch.status);
+    // 跳过（SKIPPED）= 持久排除：被跳过的章节不会在后续「开始判定」被再次拾取，
+    // 需要行内「重判」/「重判全部」显式解除（语义与加料队列一致）
+    return [CHAPTER_STATUS.UNDETECTED, CHAPTER_STATUS.FAILED].includes(ch.status);
 }
 
 /** 批量模式：把待判定章节按每批章数分组（每组 = 队列一项，一次 AI 调用）。 */
@@ -1973,6 +2286,9 @@ function niJudgeConcurrency() {
 
 /** 判定队列按当前模式分发：batch → 分组批量队列；其余 → 逐章队列。 */
 function niJudgeEnsureQueue() {
+    // 运行中不换实例：引擎切换后旧实例可能仍在跑，若此刻新建实例会覆盖引用，
+    // 产生失控的孤儿队列并发处理同一批章节
+    if (niJudgeQueue?.isRunning?.()) return niJudgeQueue;
     const isBatch = niJudgeRules().mode === 'batch';
     if (isBatch ? niJudgeBatchQueueCreated : niJudgeQueueCreated) return niJudgeQueue;
     if (isBatch) niJudgeBatchQueueCreated = true; else niJudgeQueueCreated = true;
@@ -2085,6 +2401,14 @@ function niJudgeRenderStats() {
     const judged = c.judged + c.modified;
     const parts = [`待判定 ${c.undetected}`, `判定中 ${c.detecting}`, `已判定 ${judged}`];
     if (c.suspicious > 0) parts.push(`可疑 ${c.suspicious}`);
+    // 场景类型统计（scene_type 全链路落地：关键词引擎与 AI 判定都会标注）
+    const tc = { explicit_sex: 0, romantic_tension: 0, romance: 0, neutral: 0, violence: 0 };
+    chapters.forEach(ch => {
+        const st = ch?.judge?.sceneType;
+        if (st && Object.prototype.hasOwnProperty.call(tc, st)) tc[st]++;
+    });
+    const typeParts = Object.keys(tc).filter(k => tc[k] > 0).map(k => `${sceneTypeLabel(k) || k} ${tc[k]}`);
+    if (typeParts.length) parts.push(`类型：${typeParts.join('，')}`);
     parts.push(`失败 ${c.failed}`, `跳过 ${c.skipped}`);
     el.textContent = parts.join(' · ');
 }
@@ -2132,12 +2456,12 @@ function niJudgeSyncButtons(running) {
     }
 }
 
-/** 只把失败的章节重置并重新判定（不碰已判定/跳过的）。 */
+/** 只把失败的章节重置并重新判定（不碰已判定/跳过的；加料阶段失败、已保留生成内容的章不在此列）。 */
 function niJudgeRejudgeFailed() {
     if (niJudgeActiveQueue()?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
-    const targets = chapters.filter(ch => ch.status === CHAPTER_STATUS.FAILED);
-    if (!targets.length) { toastr?.info('没有失败的章节'); return; }
+    const targets = chapters.filter(ch => ch.status === CHAPTER_STATUS.FAILED && !ch.enrich);
+    if (!targets.length) { toastr?.info('没有可重判的章节（加料失败的章请到「加料」页点「重试失败」）'); return; }
     targets.forEach(niEnrichResetForRejudge);
     niEnrichScheduleSave();
     niEnrichRenderList();
@@ -2269,9 +2593,13 @@ function niJudgeSyncSettingsUI() {
 function niJudgeRejudgeAll() {
     if (niJudgeActiveQueue()?.isRunning?.()) { toastr?.warning('队列运行中，请先暂停或等待完成'); return; }
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
-    const targets = chapters.filter(ch => !ch.filtered && ![CHAPTER_STATUS.DETECTING, CHAPTER_STATUS.ENRICHING].includes(ch.status));
-    if (!targets.length) { toastr?.warning('没有可重新判定的章节'); return; }
-    if (!confirm(`将重置 ${targets.length} 个章节的判定结果并全部重新判定（已判定/失败/跳过都会被覆盖重跑，AI 模式会消耗 API 额度）？`)) return;
+    // 已带加料结果（含失败但保留内容）的章不在此列：重判会清空 enrich，属数据丢失操作，
+    // 需要重判的已加料章请使用行内「重判」（会显式提示）
+    const targets = chapters.filter(ch => !ch.filtered
+        && !ch.enrich
+        && ![CHAPTER_STATUS.DETECTING, CHAPTER_STATUS.ENRICHING].includes(ch.status));
+    if (!targets.length) { toastr?.info('没有可重新判定的章节（已加料/加料失败的章请单章「重判」处理）'); return; }
+    if (!confirm(`将重置 ${targets.length} 个章节的判定结果并全部重新判定（未加料章的判定/失败/跳过都会被覆盖重跑，AI 模式会消耗 API 额度）？`)) return;
     targets.forEach(niEnrichResetForRejudge);
     niEnrichScheduleSave();
     niEnrichRenderList();
@@ -2281,10 +2609,15 @@ function niJudgeRejudgeAll() {
 }
 
 function niJudgeExportCsv() {    const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
-    const rows = [['章节', '标题', '判定结果', '置信度', '模式', '证据']];
+    const rows = [['章节', '标题', '判定结果', '置信度', '模式', '场景类型', '子类型', '加料建议', '证据']];
     chapters.forEach(ch => {
         if (!ch.judge) return;
-        rows.push([ch.index, ch.title, judgeResultLabel(ch.judge.result), ch.judge.confidence, ch.judge.mode, String(ch.judge.evidence || '')]);
+        const type = ch.judge.sceneType ? (sceneTypeLabel(ch.judge.sceneType) || ch.judge.sceneType) : '';
+        const sub = (ch.judge.sceneSubtype && ch.judge.sceneSubtype !== 'unclear')
+            ? (sceneSubtypeLabel(ch.judge.sceneSubtype) || ch.judge.sceneSubtype) : '';
+        const hints = Array.isArray(ch.judge.enrichHints) ? ch.judge.enrichHints.join('；') : '';
+        rows.push([ch.index, ch.title, judgeResultLabel(ch.judge.result), ch.judge.confidence, ch.judge.mode,
+            type, sub, hints, String(ch.judge.evidence || '')]);
     });
     if (rows.length <= 1) { toastr?.warning('还没有判定结果可导出'); return; }
     const csv = '\uFEFF' + rows.map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\r\n');
@@ -2436,20 +2769,24 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         if (!canEnrichChapter(ch)) throw new Error('本章无加料资格（需判定为「是/存疑」或人工标记「通过」）');
         if (!transitionChapter(ch, CHAPTER_STATUS.ENRICHING)) ch.status = CHAPTER_STATUS.ENRICHING;
     }
-    const safety = niEnrichSafety();
-    if (safety.enabled && checkSensitive(ch.text, safety.sensitiveWords)) {
-        const hit = checkSensitive(ch.text, safety.sensitiveWords);
-        ch.error = `原文含敏感词「${hit.word}」，已跳过`;
-        throw new Error(ch.error);
-    }
-    if (niEnrichQuotaReached()) {
-        if (!_niEnrichQuotaWarned) {
-            _niEnrichQuotaWarned = true;
-            toastr?.warning('已达每日加料调用限额，加料已自动停止（可在设置中调整或明天继续）');
-        }
-        throw new Error('已达每日调用限额，加料已停止');
-    }
     try {
+        // —— 敏感词/每日限额预检必须在 try 内 ——
+        // 入口已把状态推进为 ENRICHING，若在 try 外 throw，isPermanentError 的
+        // 状态恢复（ENRICHING→JUDGED）不会执行：队列场景章节会永久卡"加料中"。
+        const safety = niEnrichSafety();
+        if (safety.enabled && checkSensitive(ch.text, safety.sensitiveWords)) {
+            const hit = checkSensitive(ch.text, safety.sensitiveWords);
+            ch.error = `原文含敏感词「${hit.word}」，已跳过`;
+            throw new Error(ch.error);
+        }
+        if (niEnrichQuotaReached()) {
+            if (!_niEnrichQuotaWarned) {
+                _niEnrichQuotaWarned = true;
+                toastr?.warning('已达每日加料调用限额，加料已自动停止（可在设置中调整或明天继续）');
+            }
+            ch.error = '已达每日调用限额，加料已停止';
+            throw new Error(ch.error);
+        }
         const api = niEnrichApiCfg();
         const useInd = api.useIndependentApi === true;
         const usePreset = api.useTavernPreset === true;
@@ -2469,8 +2806,22 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         // 本章情报（人物卡 + 前史卡）：来自清洗管道角色表/主线节点，按文本匹配注入；
         // 未跑清洗/无匹配时为空串，不影响消息结构。
         const contextNotes = niChapterContextNotes(ch);
+        // 跨章归位章（promoNote）的补全点在章末：超长原文改取「后 4000 字符」而非开头截断，
+        // 并记录段落偏移，回传锚点换算回原文段号后回填
+        let chapterTextForAi = ch.text;
+        let paraOffset = 0;
+        if (ch.judge?.promoNote && String(ch.text || '').length > ENRICH_AI_MAX_CHARS) {
+            const full = String(ch.text);
+            const len = full.length;
+            let boundary = len - ENRICH_AI_MAX_CHARS;
+            const nl = full.indexOf('\n', boundary);
+            if (nl >= 0 && nl < len) boundary = nl + 1;
+            paraOffset = full.slice(0, boundary).split(/\r?\n+/).map(p => p.trim()).filter(p => p.length > 0).length;
+            chapterTextForAi = full.slice(boundary);
+        }
+        const toOrigPara = n => (paraOffset > 0 && Number(n) > 0 ? Number(n) + paraOffset : Number(n));
         let messages = buildEnrichMessages(template.prompt, {
-            chapterContent: ch.text,
+            chapterContent: chapterTextForAi,
             keywords: buildEnrichKeywordsSummary(ch.judge),
             style: template.style || template.name || '',
             intensity: `${enrichIntensityLabel(params.intensity)}\n${enrichIntensityGuide(params.intensity)}`,
@@ -2534,6 +2885,8 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         }
         // —— 解析加料段落（【¶N】锚点）并无缝回填原文 ——
         let segments = niParseEnrichSegments(cleaned);
+        // 跨章归位章取章末片段时，把回传锚点换算回原文段号
+        if (paraOffset > 0) segments = segments.map(s => ({ ...s, paragraph: toOrigPara(s.paragraph) }));
         if (!segments.length) {
             // AI 没按格式输出（无段落编号）：整段视为一条无锚点加料，走兜底插入
             segments = [{ paragraph: 0, content: cleaned }];
@@ -2561,7 +2914,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
                 if (!detectNoEnrichOutput(cleaned2)) {
                     const segs2 = niParseEnrichSegments(cleaned2);
                     if (segs2.length) {
-                        segments.push(...segs2);
+                        segments.push(...(paraOffset > 0 ? segs2.map(s => ({ ...s, paragraph: toOrigPara(s.paragraph) })) : segs2));
                         console.log(`[NI] 加料字数不足已自动扩写一轮：${addedLen} → ${segments.reduce((s, seg) => s + String(seg.content || '').length, 0)} 字`);
                     }
                 }
@@ -2603,7 +2956,16 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         niEnrichScheduleSave();
         return { reviewed, text: mergedText, charCount: addedLen, short: addedLen < minChars, merge: mergeResult.status };
     } catch (err) {
-        if (signal?.aborted || err?.message === 'AbortError') throw err;
+        // 用户停止（详情弹窗）/ 队列暂停/取消/跳过：先回退入口推进的状态，
+        // 否则详情单章场景会永久卡在 ENRICHING（无资格再次生成、队列也收不到）。
+        // 队列场景 prevStatus 为 ENRICHING → 回退 JUDGED（随后队列的 reset/skip 终态会覆盖，幂等）；
+        // 详情单章场景 prevStatus 为 JUDGED → 直接回到可再生成状态。
+        if (signal?.aborted || err?.message === 'AbortError') {
+            const restoreStatus = prevStatus === CHAPTER_STATUS.ENRICHING ? CHAPTER_STATUS.JUDGED : prevStatus;
+            if (ch.status === CHAPTER_STATUS.ENRICHING && ch.status !== restoreStatus) ch.status = restoreStatus;
+            niEnrichScheduleSave();
+            throw err;
+        }
         if (!niEnrichIsPermanentError(err)) {
             ch.error = niSensitivePromptHint(err?.message || String(err));
             transitionChapter(ch, CHAPTER_STATUS.FAILED);
@@ -2624,15 +2986,19 @@ function niEnrichEnsureQueue() {
     niEnrichQueueCreated = true;
     niEnrichQueue = createBatchQueueController({
         getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
-        // 待加料：有资格且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成
-        isEligible: ch => canEnrichChapter(ch) && (!ch.enrich || (ch.status === CHAPTER_STATUS.FAILED && ch.enrich.short === true)),
+        // 待加料：有资格、未跳过且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成。
+        // SKIPPED 为持久排除：跳过章不会在下次「开始加料」被自动拾取（可单章点「加」或重判解除）
+        isEligible: ch => canEnrichChapter(ch)
+            && ch.status !== CHAPTER_STATUS.SKIPPED
+            && (!ch.enrich || (ch.status === CHAPTER_STATUS.FAILED && ch.enrich.short === true)),
         processItem: enrichChapter,
         setProcessingStatus: ch => { if (ch) ch.status = CHAPTER_STATUS.ENRICHING; },
         setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
         setFailedStatus: ch => {
             if (ch && ch.status !== CHAPTER_STATUS.ENRICHED && !niEnrichIsPermanentError(ch.error)) {
                 ch.status = CHAPTER_STATUS.FAILED;
-                if (ch.error) ch.error = niSensitivePromptHint(ch.error);
+                // processItem 内已包装过一次提示，这里只在没有提示时补包，避免重复拼接
+                if (ch.error && !ch.error.includes('【提示】')) ch.error = niSensitivePromptHint(ch.error);
                 niEnrichScheduleSave();
             }
         },
@@ -2886,6 +3252,13 @@ function niEnrichSyncSettingsUI() {
 
 jQuery(async () => {
   try {
+    // 底栏导航/弹窗按钮的全局分发不依赖模板，最先绑定：
+    // 即使后续模板插入或初始化抛错，这些控件依然可用（与注释宣称的兜底一致）
+    niBindNavbarGlobal();
+    niBindGlobalActions();
+    // $app 委托绑定幂等守卫：同文档二次执行（热更新/手动重载）不会双触发
+    if (window._niJqueryBound) return;
+    window._niJqueryBound = true;
 
     // ── 顶栏 Drawer───────────
     const settingsHtml = await renderExtensionTemplateAsync(EXT_FOLDER, 'template');
@@ -2920,9 +3293,6 @@ jQuery(async () => {
         }
     }
     niBindTopbarIconToggleHandlers();
-    // 底栏导航与弹窗操作按钮立即全局绑定（即使后续初始化抛错，这些控件仍可用）
-    niBindNavbarGlobal();
-    niBindGlobalActions();
 
     // 绑定图标点击
     let _niNavbarClick = null;
@@ -2995,6 +3365,7 @@ jQuery(async () => {
         if (act === 'view' && id) {
             niEnrichOpenDetail(id);
         } else if (act === 'del' && id) {
+            if (niAnyQueueRunning()) { toastr?.warning('判定/加料队列运行中，请先暂停或等待完成再删除章节'); return; }
             if (!confirm('确定删除该章节？此操作不可撤销。')) return;
             const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
             const idx = chapters.findIndex(c => c.id === id);
@@ -3414,7 +3785,13 @@ jQuery(async () => {
         $app.on('change', '#ni-plugin-chk', () => niTogglePlugin());
     // 自动保存
         $app.on('change', '#ni-autosave-chk', function() {
+            const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+            cfg.autoSaveEnabled = this.checked;
+            saveSettingsDebounced?.();
             niAutosave.setEnabled(this.checked);
+            toastr?.info(this.checked
+                ? '已开启章节自动保存：判定/加料进度会写入服务器文件，刷新后可恢复'
+                : '已关闭章节自动保存：进度仅保留在内存（队列结束/暂停时的关键点仍会落盘一次）');
         });
 
     // 外观配色
