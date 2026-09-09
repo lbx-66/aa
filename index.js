@@ -834,19 +834,20 @@ function niStatusRowHtml(ch, badgeHtml) {
     </div>`;
 }
 
-/** 判定页：显示「可加料」章节（判定为「是/存疑」或标记「通过」）。 */
+/** 判定页：显示「待加料」章节（口径与加料队列 niEnrichQueueEligible 完全一致，
+ *  保证这里的数字 = 点「开始加料」实际会处理的章数）。 */
 function niJudgeRenderList() {
     const list = q('#ni-j-list');
     if (!list) return;
     const chapters = Array.isArray(S.enrichChapters) ? S.enrichChapters : [];
-    const eligible = chapters.filter(ch => !ch.filtered && canEnrichChapter(ch));
+    const eligible = chapters.filter(ch => !ch.filtered && niEnrichQueueEligible(ch));
     const cap = q('#ni-j-list-cap');
     if (cap) cap.textContent = eligible.length ? `共 ${eligible.length} 章` : '';
     if (!eligible.length) {
-        list.innerHTML = '<div class="ni-empty"><i class="ti ti-scan"></i>暂无「可加料」章节（判定为「是/存疑」或标记「通过」后显示在此）</div>';
+        list.innerHTML = '<div class="ni-empty"><i class="ti ti-scan"></i>暂无待加料章节（已加料/无加料/不可加料的章请在上方「判定结果分类」中查看）</div>';
     } else {
         list.innerHTML = eligible.map(ch => niStatusRowHtml(ch,
-            `<span class="ni-e-stat ni-es-d" title="判定已通过，可进行 AI 加料">可加料</span>`
+            `<span class="ni-e-stat ni-es-d" title="判定已通过，尚未加料；与「开始加料」处理的章节一致">待加料</span>`
         )).join('');
     }
     // 判定结果分类分组列表与「可加料章节」区块同步刷新
@@ -2053,12 +2054,25 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
     const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 800 });
     const parsed = parseJudgeResponse(raw);
     const isDoubt = parsed.confidence < (Number(rules.aiThreshold) || 0.6);
+    // 矛盾归一：gap_in_prev_chapter = 场景归上一章（两章间省略），本章无独立缺口。
+    // 若模型同时返回 explicit_sex/has_gap:true（自相矛盾），本章不得计为性爱情节、
+    // 不得进「可加料」——缺口已在上一章章末（由跨章归位处理）
+    let sceneType = parsed.sceneType || null;
+    let resultRaw = parsed.result;
+    let evidenceRaw = parsed.evidence;
+    if (parsed.gapInPrev === true) {
+        if (sceneType === 'explicit_sex') {
+            sceneType = 'neutral';
+            evidenceRaw = `${evidenceRaw || ''}\n（自动修正：gap_in_prev_chapter 与 explicit_sex 矛盾——场景归属上一章，本章按 neutral 计；补全缺口已在上一章章末）`.trim();
+        }
+        resultRaw = 'no';
+    }
     return {
-        result: isDoubt ? 'doubt' : parsed.result,
+        result: isDoubt ? 'doubt' : resultRaw,
         confidence: parsed.confidence,
-        evidence: parsed.evidence,
+        evidence: evidenceRaw,
         mode: 'ai',
-        sceneType: parsed.sceneType || null,
+        sceneType,
         sceneSubtype: parsed.sceneSubtype,
         enrichHints: Array.isArray(parsed.enrichHints) ? parsed.enrichHints : [],
         gapInPrev: parsed.gapInPrev === true,
@@ -2190,21 +2204,31 @@ async function judgeChapterBatch(group, { signal = null } = {}) {
             continue;
         }
         const isDoubt = res.confidence < aiThreshold;
+        // 矛盾归一：gap_in_prev_chapter = 场景归上一章，本章不得计 explicit_sex / 不得可加料
+        let sceneType = res.sceneType || null;
+        let resultRaw = res.result;
+        let evidence = res.evidence || scored.evidence;
+        if (res.gapInPrev === true) {
+            if (sceneType === 'explicit_sex') {
+                sceneType = 'neutral';
+                evidence = `${evidence}\n（自动修正：gap_in_prev_chapter 与 explicit_sex 矛盾——场景归属上一章，本章按 neutral 计；补全缺口已在上一章章末）`.trim();
+            }
+            resultRaw = 'no';
+        }
         // 低证据护栏（通用输出校验）：本地场景引擎零窗口（材料里没有任何本章场景词面证据）
         // 而 AI 判 explicit_sex/是 时，判定缺少本地佐证——不自动改判（AI 语义可能超出词表），
         // 但在证据与详情中显著提示人工复核
-        const aiExplicit = res.sceneType === 'explicit_sex' || res.result === 'yes';
+        const aiExplicit = sceneType === 'explicit_sex' || resultRaw === 'yes';
         const lowEvidence = aiExplicit === true && (scored.hitCount || 0) === 0;
-        let evidence = res.evidence || scored.evidence;
         if (lowEvidence) {
             evidence = `【复核提示】本章材料未发现任何场景窗口，AI 判定缺少本地词面佐证，请人工复核后再加料。\n${evidence}`;
         }
         ch.judge = {
-            result: isDoubt ? 'doubt' : res.result,
+            result: isDoubt ? 'doubt' : resultRaw,
             confidence: res.confidence,
             evidence,
             mode: 'batch',
-            sceneType: res.sceneType || null,
+            sceneType,
             sceneSubtype: res.sceneSubtype,
             enrichHints: Array.isArray(res.enrichHints) ? res.enrichHints : [],
             gapInPrev: res.gapInPrev === true,
@@ -2460,7 +2484,7 @@ const NI_JUDGE_TYPE_LABELS = {
     neutral: '无',
     violence: '暴力',
     vetoed: '安全否决',
-    unclassified: '未分类（旧格式/手动）',
+    unclassified: '未分类（旧格式/归位/手动）',
 };
 // 展开状态（纯 UI 记忆；默认分类组全部折叠，只显示组头概览）
 let _niJudgeTypeOpenGroups = new Set();
@@ -2471,6 +2495,17 @@ function niJudgeTypeKey(ch) {
     if (ch.judge.result === 'vetoed') return 'vetoed';
     const st = ch.judge.sceneType;
     return st && NI_JUDGE_TYPE_ORDER.includes(st) ? st : 'unclassified';
+}
+
+/** 性爱情节/未分类组中「不可加料」的可见原因（帮助核对 分类数 vs 可加料数 的差异）。 */
+function niJudgeUnavailableReason(ch) {
+    if (canEnrichChapter(ch)) return '';
+    if (ch.judge?.result === 'vetoed') return ' · 安全否决';
+    if (ch.flag === 'fail') return ' · ✕标记不通过';
+    if (ch.judge?.gapInPrev || ch.judge?.seamToPrev) return ' · 归位上一章';
+    if (ch.status === CHAPTER_STATUS.ENRICHING) return ' · 加料中';
+    if (ch.status === CHAPTER_STATUS.SKIPPED) return ' · 已跳过';
+    return ' · 不可加料';
 }
 
 /** 渲染判定结果分类分组（判定页「判定结果分类」区块）。 */
@@ -2506,12 +2541,21 @@ function niJudgeRenderTypeGroups() {
     const html = order.filter(k => groups.has(k)).map(k => {
         const list = groups.get(k).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
         const open = _niJudgeTypeOpenGroups.has(k);
+        const showReason = k === 'explicit_sex' || k === 'unclassified';
+        // 组头明细：性爱情节/未分类组显示「总 N · 待加料 M」（口径=niEnrichQueueEligible，
+        // 与下方「待加料章节」一致），差异（已加料/无加料/不可加料）展开后逐行可见
+        let countText = `${list.length} 章`;
+        if (k === 'explicit_sex' || k === 'unclassified') {
+            const ready = list.filter(ch => niEnrichQueueEligible(ch)).length;
+            countText = `${list.length} 章 · 待加料 ${ready}`;
+        }
         const rows = list.map(ch => {
             const conf = ch.judge?.confidence;
             let enrichTag = '';
             if (ch.enrich?.noContent) enrichTag = ' · 无加料';
             else if (ch.enrich?.text) enrichTag = ch.enrich.reviewed === false ? ' · 需审核' : ' · 已加料';
-            const metaText = `${Number(ch.charCount) || 0}字${conf != null ? ` · 置信度 ${conf}` : ''}${enrichTag}`;
+            const reasonTag = showReason ? niJudgeUnavailableReason(ch) : '';
+            const metaText = `${Number(ch.charCount) || 0}字${conf != null ? ` · 置信度 ${conf}` : ''}${enrichTag}${reasonTag}`;
             return `<div class="ni-type-ch" data-id="${niEscAttr(ch.id)}" title="点击查看/编辑章节">
                 <span class="ni-type-ch-title">${niEscHtml(ch.title || '')}</span>
                 <span class="ni-type-ch-meta">${niEscHtml(metaText)}</span>
@@ -2519,7 +2563,7 @@ function niJudgeRenderTypeGroups() {
         }).join('');
         return `<div class="ni-type-group">
             <button type="button" class="ni-type-head${open ? ' open' : ''}" data-type-key="${k}" title="点击展开/收起">
-                <span class="ni-type-caret">▶</span>${NI_JUDGE_TYPE_LABELS[k]}<span class="ni-type-count">${list.length} 章</span>
+                <span class="ni-type-caret">▶</span>${NI_JUDGE_TYPE_LABELS[k]}<span class="ni-type-count">${countText}</span>
             </button>
             <div class="ni-type-body">${rows}</div>
         </div>`;
@@ -3095,6 +3139,15 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
 }
 
 let niEnrichQueueCreated = false;
+
+/** 待加料口径（加料队列与判定页「待加料章节」共用同一判定，避免两处数字漂移）：
+ *  有资格、未跳过、且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成。 */
+function niEnrichQueueEligible(ch) {
+    return canEnrichChapter(ch)
+        && ch.status !== CHAPTER_STATUS.SKIPPED
+        && (!ch.enrich || (ch.status === CHAPTER_STATUS.FAILED && ch.enrich.short === true));
+}
+
 function niEnrichEnsureQueue() {
     if (niEnrichQueueCreated) return niEnrichQueue;
     niEnrichQueueCreated = true;
@@ -3102,9 +3155,7 @@ function niEnrichEnsureQueue() {
         getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
         // 待加料：有资格、未跳过且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成。
         // SKIPPED 为持久排除：跳过章不会在下次「开始加料」被自动拾取（可单章点「加」或重判解除）
-        isEligible: ch => canEnrichChapter(ch)
-            && ch.status !== CHAPTER_STATUS.SKIPPED
-            && (!ch.enrich || (ch.status === CHAPTER_STATUS.FAILED && ch.enrich.short === true)),
+        isEligible: niEnrichQueueEligible,
         processItem: enrichChapter,
         setProcessingStatus: ch => { if (ch) ch.status = CHAPTER_STATUS.ENRICHING; },
         setSkippedStatus: ch => { if (ch) { ch.status = CHAPTER_STATUS.SKIPPED; niEnrichScheduleSave(); } },
