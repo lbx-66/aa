@@ -338,27 +338,42 @@ function niLoadSettings() {
     Object.keys(DEFAULT_SETTINGS).forEach(k => {
         if (saved[k] === undefined) saved[k] = DEFAULT_SETTINGS[k];
     });
-    // 判定提示词迁移
-    const MARKER = '审核规避写作模式';
-    if (saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V2
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V3
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V4
-        || saved.judgePrompts?.template === LEGACY_JUDGE_PROMPT_V5
-        || (saved.judgePrompts?.template && !saved.judgePrompts.template.includes(MARKER))) {
-        console.log('[NI] 判定提示词迁移：旧版 → 新版（scene_type + 审核规避）');
-        saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+    // ── 判定提示词迁移（一次性，按版本号判定）────────────────────
+    // 修复要点：旧实现把「内容里是否含某个标题」当作迁移条件，每次启动都重跑。
+    // 只要用户把提示词改得不再包含该标题，下次启动就会被静默还原成出厂默认，
+    // 用户的自定义内容永久丢失。现改为只认「精确等于某个旧版内置默认值」的字符串比对，
+    // 并用 judgePromptMigration 版本号保证每个迁移在同一次安装里只执行一次。
+    saved.judgePrompts = saved.judgePrompts && typeof saved.judgePrompts === 'object' ? saved.judgePrompts : {};
+    const JP_MIGRATION_VERSION = 2;
+    const jpMigratedVersion = Number(saved.judgePromptMigration) || 0;
+    const legacyJudgeTemplates = [
+        LEGACY_JUDGE_PROMPT, LEGACY_JUDGE_PROMPT_V2, LEGACY_JUDGE_PROMPT_V3,
+        LEGACY_JUDGE_PROMPT_V4, LEGACY_JUDGE_PROMPT_V5,
+    ].filter(Boolean);
+    const legacyBatchTemplates = [
+        LEGACY_BATCH_JUDGE_PROMPT, LEGACY_BATCH_JUDGE_PROMPT_V2,
+        LEGACY_BATCH_JUDGE_PROMPT_V3, LEGACY_BATCH_JUDGE_PROMPT_V4,
+    ].filter(Boolean);
+    if (jpMigratedVersion < JP_MIGRATION_VERSION) {
+        // 仅在「存下来的内容一字不差就是某个旧版默认值」时才升级，绝不碰用户的编辑内容
+        if (legacyJudgeTemplates.includes(saved.judgePrompts.template)) {
+            console.log('[NI] 判定提示词迁移：旧版内置默认 → 新版');
+            saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+        } else if (!saved.judgePrompts.template) {
+            saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+        }
+        if (legacyBatchTemplates.includes(saved.judgePrompts.batchTemplate)) {
+            console.log('[NI] 批量判定提示词迁移：旧版内置默认 → 新版');
+            saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
+        } else if (!saved.judgePrompts.batchTemplate) {
+            saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
+        }
+        saved.judgePromptMigration = JP_MIGRATION_VERSION;
         saveSettingsDebounced();
     }
-    if (saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V2
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V3
-        || saved.judgePrompts?.batchTemplate === LEGACY_BATCH_JUDGE_PROMPT_V4
-        || (saved.judgePrompts?.batchTemplate && !saved.judgePrompts.batchTemplate.includes(MARKER))) {
-        console.log('[NI] 批量判定提示词迁移：旧版 → 新版（scene_type + 审核规避）');
-        saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
-        saveSettingsDebounced();
-    }
+    // 兜底：保证字段存在（不影响已保存的自定义内容）
+    if (!saved.judgePrompts.template) saved.judgePrompts.template = DEFAULT_JUDGE_PROMPT;
+    if (!saved.judgePrompts.batchTemplate) saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
     // 迁移后重新同步判定提示词 UI（niJudgeSyncSettingsUI 可能在 niLoadSettings 之前执行）
     try { niJudgeSyncSettingsUI(); } catch (e) { console.warn('[NI] 迁移后同步判定 UI 失败:', e?.message || e); }
     niSyncPluginToggleUI();
@@ -2914,6 +2929,7 @@ function niEnrichIsPermanentError(err) {
 let _niEnrichQuotaWarned = false;
 let _niEnrichDetailController = null;   // 详情弹窗流式生成的 abort controller
 let niEnrichTemplateSaveTimer = null;   // 模板编辑防抖保存
+let niJudgePromptSaveTimer = null;      // 判定/批量提示词编辑防抖保存
 
 /** AI 加料单个章节（批量与单章共用；流式 onDelta 实时回写 UI）。 */
 async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) {
@@ -3415,6 +3431,75 @@ function niEnrichSyncSettingsUI() {
 }
 
 
+// ============================================================
+// 提示词输入即时落盘（防抖 + 退出前强制冲刷）
+// ============================================================
+/**
+ * 把判定/批量判定提示词、加料模板编辑框的当前内容立即写入 settings。
+ * 防抖保存尚未触发时（用户改完马上刷新/关页）由此兜底，避免丢改动。
+ */
+function niFlushPromptEdits() {
+    try {
+        const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+        let dirty = false;
+        const ptEl = q('#ni-j-prompt');
+        if (ptEl && typeof ptEl.value === 'string' && cfg.judgePrompts?.template !== ptEl.value) {
+            cfg.judgePrompts = { ...(cfg.judgePrompts || {}), template: ptEl.value };
+            dirty = true;
+        }
+        const bptEl = q('#ni-j-batch-prompt');
+        if (bptEl && typeof bptEl.value === 'string' && cfg.judgePrompts?.batchTemplate !== bptEl.value) {
+            cfg.judgePrompts = { ...(cfg.judgePrompts || {}), batchTemplate: bptEl.value };
+            dirty = true;
+        }
+        // 加料模板：先做防抖保存，再把结果落盘
+        if (niEnrichTemplateSaveTimer) {
+            clearTimeout(niEnrichTemplateSaveTimer);
+            niEnrichTemplateSaveTimer = null;
+            niEnrichSaveTemplateFromUI();
+            dirty = true;
+        }
+        // 敏感词：防抖未触发时兜底
+        const wordsEl = q('#ni-e-safety-words');
+        if (wordsEl) {
+            const next = String(wordsEl.value || '').split(/\r?\n/).map(w => w.trim()).filter(Boolean);
+            const cur = niEnrichSafety().sensitiveWords || [];
+            if (next.join('\n') !== cur.join('\n')) {
+                niEnrichSaveSafety({ sensitiveWords: next });
+                dirty = true;
+            }
+        }
+        // API 连接字段与加料 API 字段使用 change 保存，未失焦时兜底
+        const apiPairs = [
+            ['#ni-j-api-url', () => niJudgeApiCfg().url, v => niJudgeSaveApi({ url: v.trim() })],
+            ['#ni-j-api-key', () => niJudgeApiCfg().key, v => niJudgeSaveApi({ key: v })],
+            ['#ni-j-api-model', () => niJudgeApiCfg().model, v => niJudgeSaveApi({ model: v.trim() })],
+            ['#ni-e-api-url', () => niEnrichApiCfg().url, v => niEnrichSaveApi({ url: v.trim() })],
+            ['#ni-e-api-key', () => niEnrichApiCfg().key, v => niEnrichSaveApi({ key: v })],
+            ['#ni-e-api-model', () => niEnrichApiCfg().model, v => niEnrichSaveApi({ model: v.trim() })],
+        ];
+        for (const [sel, getCur, save] of apiPairs) {
+            const el = q(sel);
+            if (!el) continue;
+            if (String(el.value ?? '') !== String(getCur() ?? '')) { save(el.value); dirty = true; }
+        }
+        if (dirty) saveSettingsDebounced?.();
+    } catch (e) {
+        console.warn('[NI] 提示词落盘失败:', e?.message || e);
+    }
+}
+
+/** 刷新/关闭页面前同步落盘（beforeunload 无法等待异步，故用同步写入路径）。 */
+function niBindPromptFlushOnExit() {
+    if (window._niPromptFlushBound) return;
+    window._niPromptFlushBound = true;
+    window.addEventListener('beforeunload', niFlushPromptEdits);
+    window.addEventListener('pagehide', niFlushPromptEdits);
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') niFlushPromptEdits();
+    });
+}
+
 jQuery(async () => {
   try {
     // 底栏导航/弹窗按钮的全局分发不依赖模板，最先绑定：
@@ -3788,6 +3873,16 @@ jQuery(async () => {
         cfg.judgePrompts = { ...(cfg.judgePrompts || {}), template: this.value };
         saveSettingsDebounced?.();
     });
+    // 输入即存（防抖）：只靠 change 时，用户改完直接刷新/关页会丢掉未失焦的内容
+    $app.on('input', '#ni-j-prompt', function () {
+        const value = this.value;
+        clearTimeout(niJudgePromptSaveTimer);
+        niJudgePromptSaveTimer = setTimeout(() => {
+            const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+            cfg.judgePrompts = { ...(cfg.judgePrompts || {}), template: value };
+            saveSettingsDebounced?.();
+        }, 500);
+    });
     $app.on('change', '#ni-j-batch-size', function () {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
         cfg.sceneConfig = { ...niSceneConfig(), batch_chapters_per_call: Math.max(1, Math.min(50, parseInt(this.value, 10) || 6)) };
@@ -3803,6 +3898,16 @@ jQuery(async () => {
         const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
         cfg.judgePrompts = { ...(cfg.judgePrompts || {}), batchTemplate: this.value };
         saveSettingsDebounced?.();
+    });
+    // 输入即存（防抖），同 #ni-j-prompt
+    $app.on('input', '#ni-j-batch-prompt', function () {
+        const value = this.value;
+        clearTimeout(niJudgePromptSaveTimer);
+        niJudgePromptSaveTimer = setTimeout(() => {
+            const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
+            cfg.judgePrompts = { ...(cfg.judgePrompts || {}), batchTemplate: value };
+            saveSettingsDebounced?.();
+        }, 500);
     });
     $app.on('click', '#ni-j-api-models', async () => {
         const api = niJudgeApiCfg();
@@ -3890,8 +3995,15 @@ jQuery(async () => {
 
     // 安全过滤
     $app.on('change', '#ni-e-safety-enabled', function () { niEnrichSaveSafety({ enabled: this.checked }); });
-    $app.on('change', '#ni-e-safety-words', function () {
-        niEnrichSaveSafety({ sensitiveWords: String(this.value || '').split(/\r?\n/).map(w => w.trim()).filter(Boolean) });
+    const saveSafetyWords = value => {
+        niEnrichSaveSafety({ sensitiveWords: String(value || '').split(/\r?\n/).map(w => w.trim()).filter(Boolean) });
+    };
+    $app.on('change', '#ni-e-safety-words', function () { saveSafetyWords(this.value); });
+    // 输入即存（防抖）：避免改完直接刷新丢掉未失焦的内容
+    $app.on('input', '#ni-e-safety-words', function () {
+        const value = this.value;
+        clearTimeout(niJudgePromptSaveTimer);
+        niJudgePromptSaveTimer = setTimeout(() => saveSafetyWords(value), 500);
     });
 
     // 加料 API 面板
@@ -3977,6 +4089,7 @@ jQuery(async () => {
 
     // 加载设置
     niLoadSettings();
+    niBindPromptFlushOnExit();
     niSyncTopbarIconVisibility();
     niEnsureExtensionsMenuTopbarToggle();
 
