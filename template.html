@@ -93,14 +93,6 @@
               <span class="ni-switch-txt" id="ni-theme-cardless-state" style="display:inline-block;font-size:11px;font-weight:700;transition:color .2s;color:var(--ni-primary,#A0445E)">关</span>
             </span>
           </label>
-          <label class="ni-switch-row" id="ni-theme-statusbar-follow-row">
-            <span class="ni-switch-label">状态栏跟随</span>
-            <span class="ni-switch-wrap">
-              <input type="checkbox" id="ni-theme-statusbar-follow" style="position:absolute;opacity:0;width:0;height:0">
-              <span class="ni-switch-track"><span class="ni-switch-knob"></span></span>
-              <span class="ni-switch-txt" id="ni-theme-statusbar-follow-state" style="display:inline-block;font-size:11px;font-weight:700;transition:color .2s;color:var(--ni-primary,#A0445E)">关</span>
-            </span>
-          </label>
           <label class="ni-switch-row" id="ni-theme-icon-replace-row" title="使用阿里 iconfont 替换插件图标">
             <span class="ni-switch-label">图标替换</span>
             <span class="ni-switch-wrap">
@@ -249,9 +241,6 @@
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-engine-batch"> 批量场景扫描（AI，N章/次，独立运行）</label>
             <div class="ni-desc" style="margin:0 0 4px">组合：仅关键词 = 免费快筛；仅 AI = 逐章深度分析；关键词 + AI = 先关键词初筛，再按范围 AI 精判（「仅可疑」推荐，省额度）；批量 = 按组打包扫描，不与关键词/AI 组合。</div>
             <div class="ni-desc" style="margin:0 0 4px">关键词判定（场景引擎）：词库→阶段分类→场景窗口→补全决策，移植自 Auto Scene 3.5 判定逻辑——有可补全窗口→「是」、仅有场景无明确缺口→「可疑」、无场景→「否」、命中未成年/非自愿/多人男等→「安全否决」；「开始判定」按勾选组合自动执行，也可先「关键词初筛」查看，再点「AI 精判可疑」手动精判。</div>
-            <label class="ni-j-cfg-lbl">判定阈值（仅参与置信度换算；是/否/存疑/安全否决由场景窗口决策决定）
-              <input type="number" id="ni-j-threshold" value="2" min="1" style="width:60px">
-            </label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-safety-veto" checked> 安全否决（未成年/非自愿/多人男/排除名单命中 → 判「安全否决」不可加料；关闭后不做词法否决，请自行把握内容尺度）</label>
           </div>
           <div class="ni-j-cfg-group" id="ni-j-ai-group" style="display:none">
@@ -268,13 +257,6 @@
             <div class="ni-ctitle-label">批量判定提示词模板</div>
             <textarea id="ni-j-batch-prompt" class="ni-j-prompt-textarea" rows="8" spellcheck="false"></textarea>
             <div class="ni-desc" style="margin:2px 0 0">变量：{chapters} 逐章场景材料、{rules} 规则摘要</div>
-          </div>
-          <div class="ni-j-cfg-group" id="ni-j-feature-group">
-            <div class="ni-ctitle-label">旧引擎附加特征（场景引擎下不参与评分，仅兼容保留）</div>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-cooccur" checked> 共现窗口加分（场景词+动作词在 80 字内共现）</label>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-paragraph" checked> 段落峰值（单句密集命中 ≥3 词）</label>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-ellipsis" checked> 省略号/省略写法加分（……、（此处省略））</label>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-j-feat-metaphor" checked> 比喻语境剔除（像…一样/仿佛…般 内的命中不算）</label>
           </div>
           <div class="ni-j-cfg-group" id="ni-j-kw-group">
             <div class="ni-ctitle-label">关键词库（词 · 权重；仅作为 AI 精判的规则参考，不参与场景引擎评分）</div>
@@ -442,7 +424,7 @@
           <label>作者 <input type="text" id="ni-e-exp-author" style="width:120px" placeholder="可选"></label>
           <button class="ni-e-btn" id="ni-e-exp-btn" title="导出当前小说（Ctrl+E）">导出</button>
         </div>
-        <div class="ni-desc" id="ni-e-exp-note" style="margin:4px 0 0">EPUB 正文固定为加料版（未加料章用原文）；TXT/Markdown 可按内容模式选择。</div>
+        <div class="ni-desc" id="ni-e-exp-note" style="margin:4px 0 0">三种格式（TXT / Markdown / EPUB）都按上方「内容」模式导出；未加料章自动回退原文。</div>
       </div>
       </div>
 

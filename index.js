@@ -134,9 +134,6 @@ import {
 // ============================================================
 
 const EXT_NAME = 'novel-injector';
-const NI_UPLOAD_ACCEPT = '.txt,.mobi';
-const NI_UPLOAD_LABEL = '点击上传 .txt / .mobi 文件';
-const NI_UPLOAD_HINT = '支持 .txt / .mobi，将按设定大小自动分段';
 
 // 通过 Error stack trace 获取当前模块的实际路径
 function _detectExtFolder() {
@@ -150,7 +147,6 @@ function _detectExtFolder() {
 const EXT_FOLDER = _detectExtFolder();
 
 const DEFAULT_SETTINGS = {
-    pluginEnabled: true,
     autoSaveEnabled: false,
     topbarIconVisible: true,
     themePreset: 'default',
@@ -161,7 +157,6 @@ const DEFAULT_SETTINGS = {
     themeSurfaceFollowPreset: true,
     themeBorderless: false,
     themeCardless: false,
-    themeStatusbarFollow: false,
     themeIconReplace: false,
     themeBackground: NI_THEME_DEFAULT.background,
     themeText: NI_THEME_DEFAULT.text,
@@ -376,7 +371,6 @@ function niLoadSettings() {
     if (!saved.judgePrompts.batchTemplate) saved.judgePrompts.batchTemplate = BATCH_JUDGE_PROMPT;
     // 迁移后重新同步判定提示词 UI（niJudgeSyncSettingsUI 可能在 niLoadSettings 之前执行）
     try { niJudgeSyncSettingsUI(); } catch (e) { console.warn('[NI] 迁移后同步判定 UI 失败:', e?.message || e); }
-    niSyncPluginToggleUI();
     syncSettingsToUI();
 }
 
@@ -563,22 +557,10 @@ const _enrichQueue = new PersistedRateQueue({
 });
 
 async function niAcquireFromQueue(queue, signal = null) {
-    if (!signal) {
-        await queue.acquire();
-        return;
-    }
-    if (signal.aborted) throw new Error('请求已中止（超时或用户操作）');
-    let onAbort = null;
-    const abortPromise = new Promise((_, reject) => {
-        onAbort = () => reject(new Error('请求已中止（超时或用户操作）'));
-        signal.addEventListener('abort', onAbort, { once: true });
-    });
-    try {
-        await Promise.race([queue.acquire(), abortPromise]);
-    } finally {
-        if (onAbort) signal.removeEventListener('abort', onAbort);
-    }
-    if (signal.aborted) throw new Error('请求已中止（超时或用户操作）');
+    // 排队项在 signal 中止时会被队列移除并拒绝（见 PersistedRateQueue.acquire），
+    // 不再需要用 Promise.race 抢占——旧的抢占写法会让被中止的等待者留在队列里，白白消耗限速槽。
+    await queue.acquire(signal);
+    if (signal?.aborted) throw new Error('请求已中止（超时或用户操作）');
 }
 
 async function niAcquireJudgeRateSlot(signal = null) {
@@ -609,9 +591,6 @@ const niThemeEditor = createThemeEditor({
     niEscAttr,
     niEscHtml,
     saveSettingsDebounced,
-    refreshStatusbar: draft => {
-        if (typeof niRefreshStorybarTheme === 'function') niRefreshStorybarTheme(draft);
-    },
 });
 
 function niApplyCurrentTheme() {
@@ -621,34 +600,6 @@ function niApplyCurrentTheme() {
 function niSyncThemeUI() {
     niThemeEditor.syncUI();
 }
-
-// ============================================================
-// 插件总开关
-// ============================================================
-function niSyncPluginToggleUI() {
-    const cfg = extension_settings[EXT_NAME] || {};
-    const enabled = cfg.pluginEnabled !== false;
-    const chk = q('#ni-plugin-chk');
-    const stateLabel = q('#ni-plugin-state');
-    const hint = q('#ni-plugin-disabled-hint');
-    const row = q('#ni-plugin-switch-row');
-    if (chk) chk.checked = enabled;
-    if (stateLabel) stateLabel.textContent = enabled ? '开' : '关';
-    if (hint) hint.style.display = enabled ? 'none' : 'inline-flex';
-    if (row) row.classList.toggle('ni-switch-off', !enabled);
-    const autoSaveChk = q('#ni-autosave-chk');
-    if (autoSaveChk) autoSaveChk.checked = cfg.autoSaveEnabled === true;
-}
-
-function niTogglePlugin() {
-    const cfg = extension_settings[EXT_NAME];
-    const chk = q('#ni-plugin-chk');
-    const enabled = chk ? chk.checked : cfg.pluginEnabled === false;
-    cfg.pluginEnabled = enabled;
-    niSyncPluginToggleUI();
-    niSaveSettings();
-}
-window.niTogglePlugin = niTogglePlugin;
 
 // ============================================================
 // 数据导入/导出
@@ -1507,7 +1458,7 @@ function niKeptNeighbors(ch) {
 let _niEnrichSaveQueue = Promise.resolve();
 let _niEnrichSaveTimer = null;
 
-// 服务端文件读写轻量封装（原 storage-system.js createStorageController 内部逻辑，此处内联）
+// 服务端文件读写轻量封装（章节持久化专用：上传 / 读取 / 删除）
 function niHeavyPartFileName(fileKey, part) {
     return `${niServerFileId(fileKey)}_${part}.json`;
 }
@@ -1517,28 +1468,36 @@ function niPrepareServerJsonUpload(name, payload) {
 }
 
 async function niServerUploadJson(bodyString) {
+    // keepalive 请求体有约 64 KiB 的总量上限（Chrome 实现超限直接抛 TypeError）。
+    // 整本书（正文+判定+加料，base64 后还会再涨 33%）必然超限，因此只在请求体足够小时
+    // 才启用 keepalive（此时关页兜底才有意义），大文件走普通 POST。
+    const useKeepalive = typeof bodyString === 'string' && bodyString.length <= 60000;
     const res = await fetch('/api/files/upload', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: bodyString,
-        keepalive: true, // 页面关闭前兜底保存尽量送达
+        ...(useKeepalive ? { keepalive: true } : {}),
     });
     if (!res.ok) throw new Error(`服务端写入失败: ${res.status}`);
 }
 
 /** 删除服务端文件（换书/换备份时清理旧 key 的章节文件，避免孤儿文件累积与原文残留）。 */
 async function niServerDeleteJson(name) {
-    try {
-        const res = await fetch('/api/files/delete', {
-            method: 'POST',
-            headers: getRequestHeaders(),
-            body: JSON.stringify({ name }),
-        });
-        if (!res.ok && res.status !== 404) {
-            console.warn('[NI] 旧章节文件删除失败:', name, res.status);
+    // 酒馆各版本对 /api/files/delete 的字段约定不一致（name 或 path），
+    // 两种都试一次，都失败才告警——否则旧书文件会静默残留。
+    const attempts = [{ name }, { path: `user/files/${name}` }];
+    for (const body of attempts) {
+        try {
+            const res = await fetch('/api/files/delete', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify(body),
+            });
+            if (res.ok || res.status === 404) return; // 404 = 文件本就不存在
+            console.warn('[NI] 旧章节文件删除失败:', name, res.status, JSON.stringify(body));
+        } catch (e) {
+            console.warn('[NI] 旧章节文件删除失败:', e?.message || e);
         }
-    } catch (e) {
-        console.warn('[NI] 旧章节文件删除失败:', e?.message || e);
     }
 }
 
@@ -2730,7 +2689,6 @@ function niJudgeSyncSettingsUI() {
     const rules = niJudgeRules();
     const api = niJudgeApiCfg();
     niJudgeSyncEngineUI(rules.mode || 'keyword');
-    sv('#ni-j-threshold', rules.threshold ?? 3);
     sv('#ni-j-ai-threshold', rules.aiThreshold ?? 0.6);
     sv('#ni-j-api-url', api.url || '');
     sv('#ni-j-api-key', api.key || '');
@@ -2750,13 +2708,6 @@ function niJudgeSyncSettingsUI() {
     // 安全否决开关
     const svEl = q('#ni-j-safety-veto');
     if (svEl) svEl.checked = niSceneConfig().safetyVetoEnabled !== false;
-    // 附加特征开关
-    const feat = rules.features || {};
-    const fEl = (id, val) => { const el = q(id); if (el) el.checked = val !== false; };
-    fEl('#ni-j-feat-cooccur', feat.cooccur !== false);
-    fEl('#ni-j-feat-paragraph', feat.paragraph !== false);
-    fEl('#ni-j-feat-ellipsis', feat.ellipsis !== false);
-    fEl('#ni-j-feat-metaphor', feat.metaphorDownweight !== false);
     niJudgeRenderKeywords();
     niJudgeRenderRegexes();
     niJudgeSyncModeUI();
@@ -2931,6 +2882,41 @@ let _niEnrichDetailController = null;   // 详情弹窗流式生成的 abort con
 let niEnrichTemplateSaveTimer = null;   // 模板编辑防抖保存
 let niJudgePromptSaveTimer = null;      // 判定/批量提示词编辑防抖保存
 
+const NI_ENRICH_MAX_TOKENS_CAP = 65536;
+
+/**
+ * 加料 API 调用（含截断自动放大）：
+ * 输出被 finish_reason=length 截断时把上限翻倍重试（最多 3 次，封顶 65536），
+ * 其余错误按 api.retries 次数指数退避重试。判定侧的 niJudgeCallRetry 是同一套策略。
+ */
+async function niEnrichCallWithGrowth(messages, { signal = null, onDelta = null, maxTokens = 4000, retries = 0 } = {}) {
+    let budget = Math.min(NI_ENRICH_MAX_TOKENS_CAP, Math.max(256, Number(maxTokens) || 4000));
+    let truncated = 0;
+    let attempt = 0;
+    let lastErr = null;
+    while (true) {
+        if (signal?.aborted) throw new Error('AbortError');
+        try {
+            return await niEnrichCall(messages, { responseLength: budget, signal, onDelta });
+        } catch (err) {
+            if (signal?.aborted || err?.message === 'AbortError') throw err;
+            lastErr = err;
+            if (isTruncatedError(err) && truncated < 3) {
+                const next = Math.min(NI_ENRICH_MAX_TOKENS_CAP, budget * 2);
+                if (next > budget) {
+                    truncated++;
+                    console.warn(`[NI] 加料返回被长度截断（第 ${truncated} 次），放大输出上限 ${budget} → ${next} tokens`);
+                    budget = next;
+                    continue; // 截断重试不计入普通重试次数
+                }
+            }
+            if (attempt >= retries) throw lastErr;
+            attempt++;
+            await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+    }
+}
+
 /** AI 加料单个章节（批量与单章共用；流式 onDelta 实时回写 UI）。 */
 async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) {
     if (!ch || !ch.text) throw new Error('章节正文为空');
@@ -3025,23 +3011,11 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
                 console.warn('[NI] 加料预设模式：读取酒馆预设提示词失败，已退回纯插件模板。', err?.message || err);
             }
         }
-        // 最大输出长度：完全使用手动设定值
+        // 最大输出长度：以手动设定为基准，被长度截断时自动放大（见 niEnrichCallWithGrowth）
         const maxTokens = Math.min(65536, Math.max(256, Number(params.maxTokens) || 4000));
         const retries = Math.max(0, Number(api.retries) || 0);
-        let raw = '';
-        let lastErr = null;
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            if (signal?.aborted) throw new Error('AbortError');
-            try {
-                raw = await niEnrichCall(messages, { responseLength: maxTokens, signal, onDelta });
-                break;
-            } catch (err) {
-                if (signal?.aborted || err?.message === 'AbortError') throw err;
-                lastErr = err;
-                if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-            }
-        }
-        if (!raw) throw lastErr || new Error('加料 API 无返回内容');
+        const raw = await niEnrichCallWithGrowth(messages, { signal, onDelta, maxTokens, retries });
+        if (!raw) throw new Error('加料 API 无返回内容');
         niEnrichConsumeQuota();
         // —— 回传过滤：剔除思考/思维链等非正文内容（小此预设 ECoT、<thinking> 等）——
         const cleaned = niFilterEnrichOutput(raw);
@@ -3070,17 +3044,12 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         if (enforceMin && addedLen > 0 && addedLen < minChars) {
             const boostMessages = [...messages, { role: 'user', content: buildEnrichShortfallInstruction(addedLen, minChars) }];
             let raw2 = '';
-            let lastErr2 = null;
-            for (let attempt = 0; attempt <= retries; attempt++) {
-                if (signal?.aborted) throw new Error('AbortError');
-                try {
-                    raw2 = await niEnrichCall(boostMessages, { responseLength: maxTokens, signal, onDelta });
-                    break;
-                } catch (err) {
-                    if (signal?.aborted || err?.message === 'AbortError') throw err;
-                    lastErr2 = err;
-                    if (attempt < retries) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-                }
+            try {
+                raw2 = await niEnrichCallWithGrowth(boostMessages, { signal, onDelta, maxTokens, retries });
+            } catch (err) {
+                if (signal?.aborted || err?.message === 'AbortError') throw err;
+                // 扩写只是补足字数的第二轮，失败不影响已生成内容
+                console.warn('[NI] 加料字数补足扩写失败:', err?.message || err);
             }
             if (raw2) {
                 niEnrichConsumeQuota();
@@ -3093,8 +3062,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
                     }
                 }
             } else {
-                console.warn('[NI] 加料字数补足扩写失败:', lastErr2?.message || lastErr2);
-                if (ch.enrich) ch.enrich.boostFailed = true;
+                console.warn('[NI] 加料字数补足扩写没有返回内容，已跳过扩写');
             }
             addedLen = segments.reduce((sum, seg) => sum + String(seg.content || '').length, 0);
         }
@@ -3293,7 +3261,7 @@ function niEnrichExport() {
     let fileName;
     try {
         if (format === 'epub') {
-            const bytes = niBuildExportEpub(list, { title, author });
+            const bytes = niBuildExportEpub(list, { title, author, mode });
             blob = new Blob([bytes], { type: 'application/epub+zip' });
             fileName = `${base}${modeSuffix}.epub`;
         } else if (format === 'md') {
@@ -3767,21 +3735,8 @@ jQuery(async () => {
         niJudgeSyncModeUI(mode);
         niJudgeSyncButtons(false);
     });
-    $app.on('change', '#ni-j-threshold', function () {
-        niJudgeSaveRules({ threshold: Math.max(0, parseInt(this.value, 10) || 0) });
-    });
     $app.on('change', '#ni-j-ai-threshold', function () {
         niJudgeSaveRules({ aiThreshold: Math.max(0, Math.min(1, parseFloat(this.value) || 0)) });
-    });
-    // 附加特征开关
-    $app.on('change', '#ni-j-feat-cooccur, #ni-j-feat-paragraph, #ni-j-feat-ellipsis, #ni-j-feat-metaphor', () => {
-        const rules = niJudgeRules();
-        const feat = { ...(rules.features || {}) };
-        feat.cooccur = q('#ni-j-feat-cooccur')?.checked !== false;
-        feat.paragraph = q('#ni-j-feat-paragraph')?.checked !== false;
-        feat.ellipsis = q('#ni-j-feat-ellipsis')?.checked !== false;
-        feat.metaphorDownweight = q('#ni-j-feat-metaphor')?.checked !== false;
-        niJudgeSaveRules({ features: feat });
     });
 
     // 关键词/正则编辑
@@ -4093,8 +4048,6 @@ jQuery(async () => {
     niSyncTopbarIconVisibility();
     niEnsureExtensionsMenuTopbarToggle();
 
-    // 插件总开关
-        $app.on('change', '#ni-plugin-chk', () => niTogglePlugin());
     // 自动保存
         $app.on('change', '#ni-autosave-chk', function() {
             const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
@@ -4128,9 +4081,6 @@ jQuery(async () => {
     });
     $app.on('change', '#ni-theme-cardless', function() {
         niThemeEditor.setCardless(this.checked);
-    });
-    $app.on('change', '#ni-theme-statusbar-follow', function() {
-        niThemeEditor.setStatusbarFollow(this.checked);
     });
     $app.on('change', '#ni-theme-icon-replace', function() {
         niThemeEditor.setIconReplace(this.checked);
