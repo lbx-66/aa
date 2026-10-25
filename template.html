@@ -317,20 +317,9 @@
               <div class="ni-ctitle-prog-bar" id="ni-ep-title-bar" style="width:0%"></div>
             </div>
           </div>
-          <button class="ni-icon-btn" id="ni-e-cfg-btn" title="加料设置（模板/API/参数/安全）" style="margin-left:auto"><i class="ti ti-settings"></i></button>
+          <button class="ni-icon-btn" id="ni-e-cfg-btn" title="加料设置（API/参数/安全）" style="margin-left:auto"><i class="ti ti-settings"></i></button>
         </div>
-        <div class="ni-tool-row">
-          <label class="ni-timeout-label">模板
-            <select id="ni-e-template-sel" style="min-width:120px"></select>
-          </label>
-          <label class="ni-timeout-label">强度
-            <select id="ni-e-intensity">
-              <option value="light">轻度（仅暗示）</option>
-              <option value="medium">中度（适度描写）</option>
-              <option value="heavy">重度（详细描写）</option>
-            </select>
-          </label>
-        </div>
+        <div class="ni-desc" style="margin:0 0 6px">勾选「使用酒馆主预设」后，加料请求只拼接该预设的提示词 + 本章原文（逐段编号，可选附「本章情报」素材），首轮不发送插件提示词模板/输出规范/字数要求；开启「强制达标」且首轮不足时，第二轮扩写提示词会写入最低字数。</div>
         <div class="ni-tool-row">
           <button class="ni-e-btn" id="ni-btn-enrich">开始加料</button>
           <button class="ni-e-btn" id="ni-btn-enrich-pause" style="display:none">暂停</button>
@@ -344,24 +333,10 @@
         <div class="ni-chunk-list" id="ni-e-chapters" style="max-height:260px"></div>
         <div class="ni-j-settings-panel" id="ni-e-settings">
           <div class="ni-j-cfg-group">
-            <div class="ni-ctitle-label">模板管理</div>
-            <label class="ni-j-cfg-lbl">模板名称 <input type="text" id="ni-e-tpl-name"></label>
-            <label class="ni-j-cfg-lbl">风格说明 <input type="text" id="ni-e-tpl-desc"></label>
-            <div class="ni-ctitle-label">提示词模板</div>
-            <textarea id="ni-e-tpl-prompt" class="ni-j-prompt-textarea" rows="8" spellcheck="false"></textarea>
-            <div class="ni-desc" style="margin:2px 0 0">变量：{chapter_content} 原文（超长自动截断）、{keywords} 判定依据、{style} 风格、{intensity} 强度说明、{no_marker} 无加料标记、{min_chars} 最低字数</div>
-            <div class="ni-desc" style="margin:2px 0 0">输出规范（自动追加，不可关闭）：AI 只输出「加料后的情节」段落（不整章重写、不重复原文）；原文无可加料内容时只输出「无加料」标记（该章保留原文并标记跳过）；加料内容不少于下方「最低字数」。</div>
-            <div class="ni-tool-row" style="margin-top:4px">
-              <button class="ni-e-btn" id="ni-e-tpl-new">新建模板</button>
-              <button class="ni-e-btn" id="ni-e-tpl-del">删除当前</button>
-              <button class="ni-e-btn" id="ni-e-tpl-reset">恢复默认模板</button>
-            </div>
-          </div>
-          <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">生成参数</div>
             <label class="ni-j-cfg-lbl">最大输出长度 <input type="number" id="ni-e-max-tokens" value="4000" min="256" max="65536" step="100" style="width:84px"> tokens（按模型上限手动调整，如 Gemini 3.5 可填 65536）</label>
-            <label class="ni-j-cfg-lbl">最低字数 <input type="number" id="ni-e-min-chars" value="2000" min="0" step="100" style="width:84px"> 字（写入提示词与输出规范）</label>
-            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-enforce-min"> 强制达标：不足最低字数时自动追加一轮扩写；仍不足则标记失败（默认关闭——关闭时不足仅提示，不扩写不失败）</label>
+            <label class="ni-j-cfg-lbl">最低字数 <input type="number" id="ni-e-min-chars" value="2000" min="0" step="100" style="width:84px"> 字（首轮不写入提示词；开启强制达标时第二轮写入）</label>
+            <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-enforce-min"> 强制达标：不足最低字数时自动追加一轮扩写（第二轮提示词写入最低字数）；仍不足则标记失败（默认关闭——关闭时不足仅提示，不扩写不失败）</label>
           </div>
           <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">安全过滤</div>
@@ -370,6 +345,7 @@
           </div>
           <div class="ni-j-cfg-group">
             <div class="ni-ctitle-label">加料 API 来源（预设与 API 是两层，可同时勾选或同时取消）</div>
+            <div class="ni-desc" style="margin:0 0 4px">加料不发送插件提示词模板：任务提示词完全来自此处勾选的「酒馆主预设」。若未勾选主预设，请求只含本章原文，模型不会收到加料任务说明。</div>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-api-tavern"> 使用酒馆主预设（加料拼入酒馆当前预设的提示词，模型跟随酒馆当前激活模型；Custom 源需在酒馆连接里填了「自定义 API 地址」）</label>
             <label class="ni-j-cfg-lbl"><input type="checkbox" id="ni-e-api-ind" checked> 独立 API 配置（下方填写地址/Key/模型；与预设同时勾选时使用独立连接 + 预设提示词）</label>
             <div id="ni-e-api-ind-box">

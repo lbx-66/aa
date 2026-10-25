@@ -99,18 +99,14 @@ import {
 } from './lib/scene-system.js';
 
 import {
-    DEFAULT_ENRICH_TEMPLATES,
     ENRICH_AI_MAX_CHARS,
     ENRICH_MIN_CHARS,
     buildEnrichContextNotes,
-    buildEnrichKeywordsSummary,
-    buildEnrichMessages,
     buildEnrichShortfallInstruction,
+    buildEnrichMessages,
     canEnrichChapter,
     checkSensitive,
     detectNoEnrichOutput,
-    enrichIntensityGuide,
-    enrichIntensityLabel,
     mergeEnrichSegments,
     niFilterEnrichOutput,
     niParseEnrichSegments,
@@ -179,8 +175,7 @@ const DEFAULT_SETTINGS = {
     judgeApi: { url: '', key: '', model: '', stream: false, timeoutSec: 60, retries: 2, temperature: 0.15 },
     sceneConfig: DEFAULT_SCENE_CONFIG,
     enrichApi: { url: '', key: '', model: '', stream: true, timeoutSec: 120, retries: 2, temperature: 0.9, topP: 1, dailyQuota: 0, dailyQuotaDate: '', dailyQuotaUsed: 0, useTavernPreset: false, useIndependentApi: true },
-    enrichTemplates: DEFAULT_ENRICH_TEMPLATES,
-    enrichParams: { intensity: 'medium', maxTokens: 4000, minChars: ENRICH_MIN_CHARS, enforceMinChars: false, presetSkipNames: ['接', '卡思维链（K）', '快速思维链', '涩涩加速', '不只看user'] },
+    enrichParams: { maxTokens: 4000, minChars: ENRICH_MIN_CHARS, enforceMinChars: false, presetSkipNames: ['接', '卡思维链（K）', '快速思维链', '涩涩加速', '不只看user'] },
     enrichSafety: { enabled: true, sensitiveWords: [] },
 };
 
@@ -967,7 +962,7 @@ function niEnrichStateText(ch) {
     if (ch?.enrich?.noContent) return '无加料（AI 判定原文无可加料内容，已保留原文）';
     if (!ch?.enrich) return '未加料';
     const minChars = Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS);
-    const base = ch.enrich.reviewed === false ? '需人工审核' : `已生成（${enrichIntensityLabel(ch.enrich.intensity)}）`;
+    const base = ch.enrich.reviewed === false ? '需人工审核' : '已生成';
     const lenPart = typeof ch.enrich.charCount === 'number' ? ` · ${ch.enrich.charCount} 字` : '';
     const shortPart = ch.enrich.short ? ` · 不足最低 ${minChars} 字` : '';
     const segPart = Array.isArray(ch.enrich.segments) && ch.enrich.segments.length ? ` · 已回填 ${ch.enrich.segments.length} 段` : '';
@@ -1011,7 +1006,7 @@ async function niEnrichDetailGenerate(btn) {
             },
         });
         if (result?.noContent) toastr?.info('本章无可加料内容，已跳过（保留原文）');
-        else if (result?.underMin) toastr?.warning(`加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按强制字数要求标记失败；可点「重试失败」重新生成或在详情中手动补写`);
+        else if (result?.underMin) toastr?.warning(`加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按最低字数要求标记失败；可点「重试失败」重新生成或在详情中手动补写`);
         else if (result?.short) toastr?.warning(`加料完成，但仅 ${result.charCount} 字（要求 ≥${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字），建议重新生成`);
         else toastr?.success(result.reviewed ? '加料完成' : '加料完成，但内容含敏感词，请人工审核');
     } catch (err) {
@@ -2026,7 +2021,13 @@ async function aiJudgeChapter(ch, rules, signal, opts = {}) {
         context: contextChain,
     });
     const raw = await niJudgeCallRetry(messages, api, signal, { baseLength: 800 });
-    const parsed = parseJudgeResponse(raw);
+    let parsed;
+    try {
+        parsed = parseJudgeResponse(raw);
+    } catch (err) {
+        console.warn('[NI] 判定响应解析失败，原始响应：', raw);
+        throw err;
+    }
     const isDoubt = parsed.confidence < (Number(rules.aiThreshold) || 0.6);
     // 矛盾归一：gap_in_prev_chapter = 场景归上一章（两章间省略），本章无独立缺口。
     // 若模型同时返回 explicit_sex/has_gap:true（自相矛盾），本章不得计为性爱情节、
@@ -2821,19 +2822,6 @@ function niEnrichSaveParams(patch) {
     saveSettingsDebounced?.();
 }
 
-function niEnrichTemplates() {
-    const base = (DEFAULT_ENRICH_TEMPLATES || []).map(t => ({ ...t }));
-    const saved = extension_settings[EXT_NAME]?.enrichTemplates;
-    if (!Array.isArray(saved) || !saved.length) return base;
-    return saved.map(t => ({ ...t }));
-}
-
-function niEnrichSaveTemplates(list) {
-    const cfg = extension_settings[EXT_NAME] || (extension_settings[EXT_NAME] = {});
-    cfg.enrichTemplates = (Array.isArray(list) ? list : []).map(t => ({ ...t }));
-    saveSettingsDebounced?.();
-}
-
 function niEnrichSafety() {
     const base = {
         ...DEFAULT_SETTINGS.enrichSafety,
@@ -2879,7 +2867,6 @@ function niEnrichIsPermanentError(err) {
 
 let _niEnrichQuotaWarned = false;
 let _niEnrichDetailController = null;   // 详情弹窗流式生成的 abort controller
-let niEnrichTemplateSaveTimer = null;   // 模板编辑防抖保存
 let niJudgePromptSaveTimer = null;      // 判定/批量提示词编辑防抖保存
 
 const NI_ENRICH_MAX_TOKENS_CAP = 65536;
@@ -2956,13 +2943,12 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
         if (useInd && (!api.url || !api.model)) {
             throw new Error('请先在「加料设置」的独立 API 配置中填写接口地址与模型');
         }
-        const templates = niEnrichTemplates();
         const params = niEnrichParams();
         const minChars = Math.max(0, Number(params.minChars) || ENRICH_MIN_CHARS);
         const enforceMin = params.enforceMinChars === true && minChars > 0;
-        const preferredId = ch.enrich?.templateId || params.templateId || templates[0]?.id;
-        const template = templates.find(t => t.id === preferredId) || templates[0];
-        if (!template?.prompt) throw new Error('没有可用的加料模板，请先在「加料设置」中新建或恢复默认模板');
+        // 首轮不发送插件提示词模板/输出规范/字数要求：模板/文风/强度/关键词都不进入请求。
+        // 任务提示词完全由酒馆预设提供；这里只准备本章原文与「本章情报」素材。
+        // 仅当开启「强制达标」且首轮不足时，第二轮追加写入最低字数的补足指令。
         // 本章情报（人物卡 + 前史卡）：来自清洗管道角色表/主线节点，按文本匹配注入；
         // 未跑清洗/无匹配时为空串，不影响消息结构。
         const contextNotes = niChapterContextNotes(ch);
@@ -2980,18 +2966,14 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             chapterTextForAi = full.slice(boundary);
         }
         const toOrigPara = n => (paraOffset > 0 && Number(n) > 0 ? Number(n) + paraOffset : Number(n));
-        let messages = buildEnrichMessages(template.prompt, {
+        let messages = buildEnrichMessages({
             chapterContent: chapterTextForAi,
-            keywords: buildEnrichKeywordsSummary(ch.judge),
-            style: template.style || template.name || '',
-            intensity: `${enrichIntensityLabel(params.intensity)}\n${enrichIntensityGuide(params.intensity)}`,
-            minChars,
             contextNotes,
         });
         // 预设模式：把酒馆当前预设（如「泉此方改加料」）启用的提示词拼进请求，
         // 复用项目「跟随酒馆预设」机制（createTavernPresetMessageTools）：
         // 正确筛选（排除上下文/标记占位提示词）+ 酒馆宏替换（{{setvar::}}/{{getvar::}}/{{user}} 等）；
-        // 加料文风/人设跟随预设；任务模板与输出规范仍在最后一条生效。
+        // 加料请求除预设提示词外，只有最后一条 user 消息（本章原文 + 可选「本章情报」）。
         // 注意：预设只提供提示词/模型跟随，与「独立 API 连接」互不排斥（可同时勾选）。
         if (usePreset) {
             try {
@@ -3003,12 +2985,12 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
                 });
                 if (presetMsgs.length) {
                     messages = [...presetMsgs, ...messages];
-                    console.log(`[NI] 加料已拼接酒馆预设提示词 ${presetMsgs.length} 条（当前预设：${promptManager?.serviceSettings?.name || '未知'}；宏已替换；任务模板+输出规范在最后一条）`);
+                    console.log(`[NI] 加料已拼接酒馆预设提示词 ${presetMsgs.length} 条（当前预设：${promptManager?.serviceSettings?.name || '未知'}；宏已替换；本章原文在最后一条）`);
                 } else {
                     console.warn('[NI] 加料预设模式：当前酒馆预设没有可用的启用提示词——请在酒馆预设管理器确认已应用目标预设（如「泉此方改加料」）');
                 }
             } catch (err) {
-                console.warn('[NI] 加料预设模式：读取酒馆预设提示词失败，已退回纯插件模板。', err?.message || err);
+                console.warn('[NI] 加料预设模式：读取酒馆预设提示词失败，本次请求仅发送本章原文。', err?.message || err);
             }
         }
         // 最大输出长度：以手动设定为基准，被长度截断时自动放大（见 niEnrichCallWithGrowth）
@@ -3076,8 +3058,6 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
             text: mergedText,          // 加料版全文（原文 + 加料段落回填）
             segments,                  // 回填段落清单（含段落号），供详情弹窗人工调整
             merge: mergeResult.status, // ok / partial / manual
-            templateId: template.id,
-            intensity: params.intensity,
             at: Date.now(),
             reviewed,
             charCount: addedLen,       // 加料内容字数（非合并后总字数）
@@ -3125,7 +3105,7 @@ async function enrichChapter(ch, index, { signal = null, onDelta = null } = {}) 
 let niEnrichQueueCreated = false;
 
 /** 待加料口径（加料队列与判定页「待加料章节」共用同一判定，避免两处数字漂移）：
- *  有资格、未跳过、且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成。 */
+ *  有资格、未跳过、且未加料；「最低字数」失败（short+failed）保留内容但允许重试重新生成。 */
 function niEnrichQueueEligible(ch) {
     return canEnrichChapter(ch)
         && ch.status !== CHAPTER_STATUS.SKIPPED
@@ -3137,7 +3117,7 @@ function niEnrichEnsureQueue() {
     niEnrichQueueCreated = true;
     niEnrichQueue = createBatchQueueController({
         getItems: () => (Array.isArray(S.enrichChapters) ? S.enrichChapters : []),
-        // 待加料：有资格、未跳过且未加料；「强制字数」失败（short+failed）保留内容但允许重试重新生成。
+        // 待加料：有资格、未跳过且未加料；「最低字数」失败（short+failed）保留内容但允许重试重新生成。
         // SKIPPED 为持久排除：跳过章不会在下次「开始加料」被自动拾取（可单章点「加」或重判解除）
         isEligible: niEnrichQueueEligible,
         processItem: enrichChapter,
@@ -3315,40 +3295,6 @@ function niEnrichSyncButtons(running) {
     }
 }
 
-// —— 模板管理 UI ——
-function niEnrichRenderTemplateSelect() {
-    const sel = q('#ni-e-template-sel');
-    if (!sel) return;
-    const templates = niEnrichTemplates();
-    sel.innerHTML = templates.map(t => `<option value="${niEscAttr(t.id)}">${niEscHtml(t.name || t.id)}</option>`).join('');
-    const curId = niEnrichParams().templateId;
-    sel.value = curId && templates.some(t => t.id === curId) ? curId : (templates[0]?.id || '');
-    niEnrichRenderTemplateEditor();
-}
-
-function niEnrichRenderTemplateEditor() {
-    const sel = q('#ni-e-template-sel');
-    if (!sel) return;
-    const t = niEnrichTemplates().find(x => x.id === sel.value);
-    if (!t) return;
-    sv('#ni-e-tpl-name', t.name || '');
-    sv('#ni-e-tpl-desc', t.description || '');
-    const pt = q('#ni-e-tpl-prompt');
-    if (pt) pt.value = t.prompt || '';
-}
-
-function niEnrichSaveTemplateFromUI() {
-    const sel = q('#ni-e-template-sel');
-    if (!sel?.value) return;
-    const templates = niEnrichTemplates();
-    const t = templates.find(x => x.id === sel.value);
-    if (!t) return;
-    t.name = String(q('#ni-e-tpl-name')?.value || '').trim() || t.name;
-    t.description = String(q('#ni-e-tpl-desc')?.value || '').trim();
-    t.prompt = String(q('#ni-e-tpl-prompt')?.value || '');
-    niEnrichSaveTemplates(templates);
-}
-
 // —— 设置同步 ——
 /** 同步加料 API 来源 UI：两个独立勾选（使用酒馆主预设 / 独立 API 配置），可同时勾选或同时取消。 */
 function niEnrichSyncTavernUI(usePreset, useIndependent) {
@@ -3386,7 +3332,6 @@ function niEnrichSyncSettingsUI() {
     const usedEl = q('#ni-e-api-quota-used');
     if (usedEl) usedEl.textContent = String(niEnrichDailyUsed());
     niEnrichSyncTavernUI(api.useTavernPreset === true, api.useIndependentApi === true);
-    sv('#ni-e-intensity', params.intensity || 'medium');
     sv('#ni-e-max-tokens', params.maxTokens ?? 4000);
     sv('#ni-e-min-chars', params.minChars ?? ENRICH_MIN_CHARS);
     const enforceMinEl = q('#ni-e-enforce-min');
@@ -3395,7 +3340,6 @@ function niEnrichSyncSettingsUI() {
     if (safetyEl) safetyEl.checked = safety.enabled !== false;
     const wordsEl = q('#ni-e-safety-words');
     if (wordsEl) wordsEl.value = (safety.sensitiveWords || []).join('\n');
-    niEnrichRenderTemplateSelect();
 }
 
 
@@ -3403,7 +3347,7 @@ function niEnrichSyncSettingsUI() {
 // 提示词输入即时落盘（防抖 + 退出前强制冲刷）
 // ============================================================
 /**
- * 把判定/批量判定提示词、加料模板编辑框的当前内容立即写入 settings。
+ * 把判定/批量判定提示词编辑框的当前内容立即写入 settings。
  * 防抖保存尚未触发时（用户改完马上刷新/关页）由此兜底，避免丢改动。
  */
 function niFlushPromptEdits() {
@@ -3418,13 +3362,6 @@ function niFlushPromptEdits() {
         const bptEl = q('#ni-j-batch-prompt');
         if (bptEl && typeof bptEl.value === 'string' && cfg.judgePrompts?.batchTemplate !== bptEl.value) {
             cfg.judgePrompts = { ...(cfg.judgePrompts || {}), batchTemplate: bptEl.value };
-            dirty = true;
-        }
-        // 加料模板：先做防抖保存，再把结果落盘
-        if (niEnrichTemplateSaveTimer) {
-            clearTimeout(niEnrichTemplateSaveTimer);
-            niEnrichTemplateSaveTimer = null;
-            niEnrichSaveTemplateFromUI();
             dirty = true;
         }
         // 敏感词：防抖未触发时兜底
@@ -3660,7 +3597,7 @@ jQuery(async () => {
                 niEnrichRenderStats();
                 niEnrichSyncButtons(false);
                 if (result?.noContent) toastr?.info(`「${ch.title}」无可加料内容，已跳过（保留原文）`);
-                else if (result?.underMin) toastr?.warning(`「${ch.title}」加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按强制字数要求标记失败；可重试或手动补写`);
+                else if (result?.underMin) toastr?.warning(`「${ch.title}」加料字数不足 ${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字（实际 ${result.charCount} 字），已按最低字数要求标记失败；可重试或手动补写`);
                 else if (result?.short) toastr?.warning(`「${ch.title}」加料完成，但仅 ${result.charCount} 字（要求 ≥${Math.max(0, Number(niEnrichParams().minChars) || ENRICH_MIN_CHARS)} 字），建议重新生成`);
                 else toastr?.success(result.reviewed ? `「${ch.title}」加料完成` : `「${ch.title}」加料完成，内容含敏感词需审核`);
             } catch (err) {
@@ -3903,43 +3840,7 @@ jQuery(async () => {
     // ── 加料卡片（工具栏按钮已由 niBindGlobalActions() 全局分发）──
     $app.on('click', '#ni-e-cfg-btn', () => niTogglePanel('ni-e-settings', 'ni-e-cfg-btn'));
 
-    // 模板选择与编辑
-    $app.on('change', '#ni-e-template-sel', function () {
-        niEnrichSaveParams({ templateId: this.value });
-        niEnrichRenderTemplateEditor();
-    });
-    $app.on('input', '#ni-e-tpl-name, #ni-e-tpl-desc, #ni-e-tpl-prompt', () => {
-        clearTimeout(niEnrichTemplateSaveTimer);
-        niEnrichTemplateSaveTimer = setTimeout(() => {
-            niEnrichSaveTemplateFromUI();
-            niEnrichRenderTemplateSelect();
-        }, 500);
-    });
-    $app.on('click', '#ni-e-tpl-new', () => {
-        const templates = niEnrichTemplates();
-        const tpl = { id: `custom_${Date.now().toString(36)}`, name: '新模板', description: '', prompt: '' };
-        templates.push(tpl);
-        niEnrichSaveTemplates(templates);
-        niEnrichSaveParams({ templateId: tpl.id });
-        niEnrichRenderTemplateSelect();
-    });
-    $app.on('click', '#ni-e-tpl-del', () => {
-        const sel = q('#ni-e-template-sel');
-        if (!sel?.value) return;
-        if (!confirm('确定删除当前模板？')) return;
-        const templates = niEnrichTemplates().filter(t => t.id !== sel.value);
-        niEnrichSaveTemplates(templates.length ? templates : DEFAULT_ENRICH_TEMPLATES.map(t => ({ ...t })));
-        niEnrichSaveParams({ templateId: templates[0]?.id || '' });
-        niEnrichRenderTemplateSelect();
-    });
-    $app.on('click', '#ni-e-tpl-reset', () => {
-        if (!confirm('恢复内置默认模板？当前自定义模板将被覆盖。')) return;
-        niEnrichSaveTemplates(DEFAULT_ENRICH_TEMPLATES.map(t => ({ ...t })));
-        niEnrichRenderTemplateSelect();
-    });
-
     // 参数
-    $app.on('change', '#ni-e-intensity', function () { niEnrichSaveParams({ intensity: this.value }); });
     $app.on('change', '#ni-e-max-tokens', function () {
         niEnrichSaveParams({ maxTokens: Math.min(65536, Math.max(256, parseInt(this.value, 10) || 4000)) });
     });
